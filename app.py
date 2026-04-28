@@ -24,6 +24,7 @@ import sqlite3
 import datetime
 import requests
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -33,7 +34,11 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ── Config ────────────────────────────────────────────────────
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL      = "mixtral-8x7b-32768"
+# Two competing models — fastest valid response wins; other is fallback
+_GROQ_MODELS    = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+]
 REQUEST_TIMEOUT = int(os.environ.get("PROMETIX_TIMEOUT", "30"))
 
 # ── SQLite setup ──────────────────────────────────────────────
@@ -186,7 +191,39 @@ def get_prompt_style(intent, user_message):
     detail = "Keep it simple and direct." if length < 6 else "Expand with better detail and structure."
     return f"{base} {detail}"
 
+def _call_single_model(model: str, messages: list) -> str:
+    """Call one Groq model. Returns the response text or raises on error."""
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "model":       model,
+            "messages":    messages,
+            "temperature": 0.4,
+            "max_tokens":  512,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise Exception(f"HTTP {response.status_code}: {response.text}")
+    result = response.json()
+    if "choices" not in result or not result["choices"]:
+        raise Exception("No choices in response")
+    text = result["choices"][0]["message"]["content"].strip()
+    if not text:
+        raise Exception("Empty content in response")
+    return text
+
+
 def call_groq(user_message: str) -> str:
+    """
+    Race both models simultaneously. Return the first successful response.
+    If the winner fails or returns empty, fall back to the other model's result.
+    If both fail, raise the last error.
+    """
     if not GROQ_API_KEY:
         raise Exception("GROQ_API_KEY environment variable is not set.")
 
@@ -198,38 +235,35 @@ def call_groq(user_message: str) -> str:
         f"COMPLEXITY: {'simple' if length < 6 else 'advanced'}\n\n"
         f"Raw idea:\n{user_message}"
     )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
+    ]
 
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type":  "application/json",
-        },
-        json={
-            "model":       GROQ_MODEL,
-            "messages":    [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_content},
-            ],
-            "temperature": 0.4,
-            "max_tokens":  512,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
+    last_error = None
+    with ThreadPoolExecutor(max_workers=len(_GROQ_MODELS)) as executor:
+        futures = {
+            executor.submit(_call_single_model, model, messages): model
+            for model in _GROQ_MODELS
+        }
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                # Cancel remaining futures (best-effort)
+                for f in futures:
+                    if f is not future:
+                        f.cancel()
+                return result
+            except Exception as e:
+                last_error = e
+                continue  # Try next model to finish
 
-    if response.status_code != 200:
-        raise Exception(f"Groq API error {response.status_code}: {response.text}")
-
-    result = response.json()
-    if "choices" not in result or not result["choices"]:
-        raise Exception("Invalid response from Groq API.")
-
-    return result["choices"][0]["message"]["content"].strip()
+    raise Exception(f"All models failed. Last error: {last_error}")
 
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "model": GROQ_MODEL, "product": "Prometix by Atimos AI"})
+    return jsonify({"status": "ok", "product": "Prometix by Atimos AI"})
 
 # ── Generate ─────────────────────────────────────────────────
 @app.route("/generate", methods=["POST"])
@@ -254,7 +288,7 @@ def generate():
     if not ai_text:
         return jsonify({"error": "Backend returned an empty response. Try rephrasing."}), 502
 
-    return jsonify({"response": ai_text, "model": GROQ_MODEL, "done": True})
+    return jsonify({"response": ai_text, "done": True})
 
 # ── Auth: register ────────────────────────────────────────────
 @app.route("/auth/register", methods=["POST"])
@@ -401,7 +435,7 @@ if __name__ == "__main__":
     print("  ║   Prometix by Atimos AI  —  v3.0         ║")
     print("  ║   Mode : Prompt Engineering Tool         ║")
     print("  ╚══════════════════════════════════════════╝")
-    print(f"\n  AI backend  : Groq API ({GROQ_MODEL})")
+    print(f"\n  AI backend  : Groq API (dual-model, race mode)")
     print(f"  DB path     : {DB_PATH}")
     print(f"  Endpoints   : /auth/register  /auth/login  /auth/logout  /generate")
     print(f"  Security    : bcrypt hashing  UUID tokens  SQLite\n")
