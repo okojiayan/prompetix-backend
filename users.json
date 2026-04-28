@@ -1,0 +1,14 @@
+{
+  "okojiayan@hotmail.com": {
+    "email": "okojiayan@hotmail.com",
+    "name": "Ayan",
+    "password": "scrypt:32768:8:1$qSQLpvG3B2xxuxds$5edf6546da16d0a2a07c65fc5bce544bb4a52b2d9e0b3f6aad18ff0eb4ab8bea34071379e01179446930d09798d84b9f749a89622effd4596a7bee62a0ccad1e",
+    "provider": "email",
+    "avatar": "A",
+    "created_at": "2026-04-28T08:02:32.283313",
+    "firstSeen": "2026-04-28T08:02:32.283313",
+    "lastSeen": "2026-04-28T08:02:32.283313",
+    "loginCount": 0,
+    "consent": true
+  }
+}
