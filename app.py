@@ -413,12 +413,6 @@ def auth_register():
     print(f"  [REGISTER] {email}  —  {ts}")
     token = _issue_token(email)
 
-    # Send email AFTER DB work
-    send_email(
-        "admin@atimosai.com",
-        "New User Registered",
-        f"Name: {name}\nEmail: {email}\nTime: {ts}"
-    )
     with db() as conn:
         user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
@@ -465,13 +459,6 @@ def auth_login():
     token = _issue_token(email)
     print(f"  [LOGIN]  {email}  —  {ts}")
 
-    # Send email AFTER DB work
-    user_ip = request.remote_addr
-    send_email(
-        "admin@atimosai.com",
-        "User Login Alert",
-        f"User Logged In\nEmail: {email}\nTime: {ts}\nIP: {user_ip}"
-    )
 
     return jsonify({"status": "ok", "token": token, "user": _public_profile(user)})
 
@@ -679,12 +666,6 @@ def google_callback():
                     (ts, email)
                 )
 
-        user_ip = request.remote_addr
-        send_email(
-            "admin@atimosai.com",
-            "Google Login Alert",
-            f"User Logged In via Google\nEmail: {email}\nName: {name}\nTime: {ts}\nIP: {user_ip}"
-        )
 
         session_token = _issue_token(email)
 
