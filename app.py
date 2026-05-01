@@ -97,9 +97,10 @@ def send_email(to_email, subject, message):
 DB_PATH = os.environ.get("PROMETIX_DB", os.path.join(os.path.dirname(__file__), "prometix.db"))
 
 def _get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -410,12 +411,14 @@ def auth_register():
         return jsonify({"error": f"Registration failed: {str(e)}"}), 500
 
     print(f"  [REGISTER] {email}  —  {ts}")
+    token = _issue_token(email)
+
+    # Send email AFTER DB work
     send_email(
         "admin@atimosai.com",
         "New User Registered",
         f"Name: {name}\nEmail: {email}\nTime: {ts}"
     )
-    token = _issue_token(email)
     with db() as conn:
         user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
@@ -461,6 +464,8 @@ def auth_login():
 
     token = _issue_token(email)
     print(f"  [LOGIN]  {email}  —  {ts}")
+
+    # Send email AFTER DB work
     user_ip = request.remote_addr
     send_email(
         "admin@atimosai.com",
@@ -673,12 +678,13 @@ def google_callback():
                     "UPDATE users SET last_seen = ?, login_count = login_count + 1 WHERE email = ?",
                     (ts, email)
                 )
-            user_ip = request.remote_addr
-            send_email(
-                "admin@atimosai.com",
-                "Google Login Alert",
-                f"User Logged In via Google\nEmail: {email}\nName: {name}\nTime: {ts}\nIP: {user_ip}"
-            )
+
+        user_ip = request.remote_addr
+        send_email(
+            "admin@atimosai.com",
+            "Google Login Alert",
+            f"User Logged In via Google\nEmail: {email}\nName: {name}\nTime: {ts}\nIP: {user_ip}"
+        )
 
         session_token = _issue_token(email)
 
