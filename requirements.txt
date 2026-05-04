@@ -3,3 +3,5 @@ flask-cors
 requests
 werkzeug
 authlib
+psycopg2-binary
+google-generativeai
