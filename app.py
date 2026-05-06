@@ -107,12 +107,63 @@ def generate_image(prompt: str) -> str:
 
     return None
 
-rate_limit_store = {}
+
+def get_client_key(email=None):
+    ip = request.remote_addr or "unknown"
+    ua = request.headers.get("User-Agent", "unknown")
+    accept = request.headers.get("Accept", "unknown")
+    lang = request.headers.get("Accept-Language", "unknown")
+
+    # persistent device cookie
+    device_id = request.cookies.get("device_id")
+
+    base = f"{ip}:{ua}:{accept}:{lang}"
+
+    # include email if logged in (stronger binding)
+    if email:
+        base += f":{email}"
+
+    import hashlib
+    fingerprint = hashlib.sha256(base.encode()).hexdigest()
+
+    return device_id or fingerprint
+
+# ── VPN / Proxy Detection ─────────────────────────────
+def is_vpn_or_proxy():
+    ip = request.remote_addr or ""
+    headers = request.headers
+
+    # Common proxy/VPN indicators
+    proxy_headers = [
+        "X-Forwarded-For",
+        "Via",
+        "X-Real-IP",
+        "Forwarded"
+    ]
+
+    for h in proxy_headers:
+        if headers.get(h):
+            return True
+
+    # Basic datacenter/VPN IP patterns (simple heuristic)
+    if ip.startswith("10.") or ip.startswith("172.") or ip.startswith("192.168"):
+        return False  # local/private, allow
+
+    # If IP looks unusual (fallback check)
+    if ip.count(".") != 3:
+        return True
+
+    return False
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret")
-CORS(app, resources={r"/*": {"origins": "*"}})
-rate_limit_store = {}
+FRONTEND_SECRET = os.environ.get("FRONTEND_SECRET", "")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax"
+)
+CORS(app, resources={r"/*": {"origins": os.environ.get("FRONTEND_URL", "*")}})
 
 # ── Google OAuth setup ───────────────────────────────────────
 oauth = OAuth(app)
@@ -209,6 +260,22 @@ def _validate_token():
     if not row:
         return None, (jsonify({"error": "Session expired. Please sign in again.", "code": "TOKEN_INVALID"}), 401)
     return row[0], None
+
+# ── Admin required decorator ─────────────────────────────
+def admin_required(f):
+    from functools import wraps
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        email, err = _validate_token()
+        if err:
+            return err
+        with db() as cur:
+            cur.execute("SELECT role FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+        if not user or user[0] != "admin":
+            return jsonify({"error": "Forbidden"}), 403
+        return f(*args, **kwargs)
+    return wrapper
 
 def _invalidate_token(token: str):
     with db() as cur:
@@ -360,40 +427,66 @@ def call_groq(user_message: str) -> str:
 
 
 # ── Gemini Function ──────────────────────────────────────────
-def call_gemini(prompt: str, model_choice: str = "auto") -> str:
-    try:
-        if model_choice == "3.1-pro":
-            model_name = "gemini-3.1-pro"
-        elif model_choice == "3.1-flash":
-            model_name = "gemini-3.1-flash"
-        elif model_choice == "1.5-pro":
-            model_name = "gemini-1.5-pro"
-        else:
-            model_name = "gemini-1.5-flash"
+# ── Gemini Function ──────────────────────────────────────────
+def call_gemini(prompt: str, model_choice: str = "3.1-pro"):
+    # ── Dynamic Fallback Chains ─────────────────────────
+    fallback_chains = {
+        "3.1-pro": [
+            "gemini-3.1-pro",
+            "gemini-3.1-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash"
+        ],
 
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt)
+        "3.1-flash": [
+            "gemini-3.1-flash",
+            "gemini-1.5-flash"
+        ],
 
-        if response:
-            # Handle text response
-            if hasattr(response, "text") and response.text:
-                return response.text.strip()
+        "1.5-pro": [
+            "gemini-1.5-pro",
+            "gemini-1.5-flash"
+        ],
 
-            # Handle possible image output (future-safe)
-            if hasattr(response, "candidates"):
-                return "Image generated (display in frontend)"
+        "1.5-flash": [
+            "gemini-1.5-flash"
+        ]
+    }
 
-    except Exception as e:
-        print("Model failed, fallback:", e)
+    model_chain = fallback_chains.get(
+        model_choice,
+        ["gemini-1.5-flash"]
+    )
 
-    # fallback
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
+    used_fallback = False
+    attempted_models = []
 
-    if response and hasattr(response, "text"):
-        return response.text.strip()
+    for idx, model_name in enumerate(model_chain):
+        try:
+            attempted_models.append(model_name)
 
-    return "No response generated"
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+
+            if response and hasattr(response, "text") and response.text:
+                return {
+                    "text": response.text.strip(),
+                    "usedFallback": idx > 0,
+                    "fallbackModel": model_name if idx > 0 else None,
+                    "attemptedModels": attempted_models
+                }
+
+        except Exception as e:
+            print(f"Gemini model failed ({model_name}):", e)
+            used_fallback = True
+            continue
+
+    return {
+        "text": "All Gemini models failed.",
+        "usedFallback": used_fallback,
+        "fallbackModel": None,
+        "attemptedModels": attempted_models
+    }
 
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
@@ -410,20 +503,55 @@ def home():
     })
 
 # ── Generate ─────────────────────────────────────────────────
-@app.route("/generate", methods=["POST"])
+@app.route("/generate-x7k9A2", methods=["POST"])
 def generate():
+    # ── Frontend Secret Verification ─────────────────────
+    if request.headers.get("X-APP-SECRET") != FRONTEND_SECRET:
+        return jsonify({"error": "Unauthorized access"}), 403
     email, err = _validate_token()
+    # Allow guest users (no login required)
     if err:
-        return err
+        email = None
 
-    user_ip = request.remote_addr
+    client_key = get_client_key(email)
     now = time()
 
-    if user_ip in rate_limit_store:
-        if now - rate_limit_store[user_ip] < 2:
-            return jsonify({"error": "Too many requests"}), 429
+    # Ensure device_id cookie is always set (anti-incognito persistence)
+    device_cookie = request.cookies.get("device_id")
+    if not device_cookie:
+        device_cookie = client_key
 
-    rate_limit_store[user_ip] = now
+    # ── VPN / Proxy Block ─────────────────────────────
+    if is_vpn_or_proxy():
+        resp = jsonify({
+            "error": "VPN or proxy detected. Please turn it off to use Prometix.",
+            "code": "VPN_BLOCKED"
+        })
+        resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+        return resp, 403
+
+    # ── Guest usage limits ─────────────────────────────
+    if not email:
+        window = 60 * 60  # 1 hour
+        limit = 2
+
+        if client_key not in rate_limit_store:
+            rate_limit_store[client_key] = []
+
+        # remove old timestamps
+        rate_limit_store[client_key] = [
+            t for t in rate_limit_store[client_key] if now - t < window
+        ]
+
+        if len(rate_limit_store[client_key]) >= limit:
+            resp = jsonify({
+                "error": "Guest limit reached (2 prompts/hour). Please login to continue.",
+                "code": "GUEST_LIMIT"
+            })
+            resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+            return resp, 429
+
+        rate_limit_store[client_key].append(now)
 
     data = request.get_json(silent=True)
     if not data:
@@ -431,8 +559,14 @@ def generate():
 
     user_message = (data.get("message") or "").strip()
     image_mode = is_image_request(user_message)
-    model_choice = (data.get("model") or "auto").lower()
+    model_choice = (data.get("model") or "3.1-pro").lower()
     mode = (data.get("mode") or "prompt").lower()
+    # ── Restrict AI features for guests ─────────────────────────
+    if not email and mode == "gemini":
+        return jsonify({
+            "error": "Login required to use AI features.",
+            "code": "LOGIN_REQUIRED"
+        }), 403
     if not user_message:
         return jsonify({"error": "Message cannot be empty."}), 400
 
@@ -440,13 +574,16 @@ def generate():
     if model_choice == "3.1-pro":
         window_seconds = 5 * 60 * 60
         now_ts = int(time())
-        
-        with db() as cur:
-            cur.execute(
-                "SELECT ts FROM generations WHERE email = %s ORDER BY ts DESC LIMIT 20",
-                (email,)
-            )
-            rows = cur.fetchall()
+
+        if email:
+            with db() as cur:
+                cur.execute(
+                    "SELECT ts FROM generations WHERE email = %s ORDER BY ts DESC LIMIT 20",
+                    (email,)
+                )
+                rows = cur.fetchall()
+        else:
+            rows = []
 
         recent = []
         for r in rows:
@@ -469,28 +606,37 @@ def generate():
 
         # Step 2: If user wants only prompt
         if mode == "prompt":
-            return jsonify({
+            resp = jsonify({
                 "type": "prompt",
                 "response": improved_prompt,
                 "done": True
             })
+            resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+            return resp
 
         # Step 3: If user selected Gemini
         if mode == "gemini":
             if image_mode:
                 image_data = generate_image(improved_prompt)
-                return jsonify({
+                resp = jsonify({
                     "type": "image",
                     "image": image_data,
                     "done": True
                 })
+                resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+                return resp
             else:
-                final_output = call_gemini(improved_prompt, model_choice)
-                return jsonify({
+                gemini_result = call_gemini(improved_prompt, model_choice)
+
+                resp = jsonify({
                     "type": "text",
-                    "response": final_output,
+                    "response": gemini_result["text"],
+                    "usedFallback": gemini_result.get("usedFallback", False),
+                    "fallbackModel": gemini_result.get("fallbackModel"),
                     "done": True
                 })
+                resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+                return resp
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -634,6 +780,40 @@ def forgot_password():
 
     return jsonify({"status": "otp_sent"})
 
+
+@app.route("/auth/send-reset-link", methods=["POST"])
+def send_reset_link():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    with db() as cur:
+        cur.execute("SELECT email FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+
+    if not user:
+        return jsonify({"error": "No account found with this email"}), 404
+
+    import random
+    otp = str(random.randint(100000, 999999))
+    expires = (datetime.datetime.utcnow() + datetime.timedelta(minutes=10)).isoformat()
+
+    with db() as cur:
+        cur.execute("DELETE FROM password_reset WHERE email = %s", (email,))
+        cur.execute(
+            "INSERT INTO password_reset (email, otp, expires_at) VALUES (%s, %s, %s)",
+            (email, otp, expires)
+        )
+
+    send_email(
+        email,
+        "Prometix Password Reset",
+        f"Your OTP is: {otp}\nValid for 10 minutes"
+    )
+
+    return jsonify({"message": "Reset link (OTP) sent to your email"})
 
 # ── Auth: reset password ─────────────────────────────────────
 @app.route("/auth/reset-password", methods=["POST"])
@@ -827,6 +1007,21 @@ def google_callback():
         import traceback
         traceback.print_exc()
         return f"Google Auth Error: {str(e)}", 500
+
+
+# ── Security Headers ─────────────────────────────────────────
+@app.after_request
+def secure_headers(response):
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data:; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline';"
+    )
+    return response
 
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
