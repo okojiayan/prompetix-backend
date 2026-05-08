@@ -4,7 +4,7 @@
 #  Run:  python app.py
 #  Requires: pip install flask flask-cors requests werkzeug
 #
-#  AI backend : Groq API (mixtral-8x7b-32768)
+#  AI backend : Multi-model AI system
 #  User store : SQLite  — persistent across restarts / deploys
 #
 #  Endpoints:
@@ -20,12 +20,21 @@
 
 import os
 import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger("prometix")
 import uuid
 import datetime
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from flask import Flask, request, jsonify, redirect
 from time import time
+from collections import defaultdict
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from authlib.integrations.flask_client import OAuth
@@ -33,6 +42,8 @@ import requests
 import json
 import psycopg2
 import google.generativeai as genai
+import re
+from functools import wraps
 
 # ── Prompt dataset (Hybrid RAG) ─────────────────────────────
 DATASET_PATH = os.path.join(os.path.dirname(__file__), "prompt_dataset.json")
@@ -96,14 +107,14 @@ def generate_image(prompt: str) -> str:
                 img.paste(logo, position, logo)
 
             except Exception as e:
-                print("Watermark error:", e)
+                logger.warning(f"Watermark error: {e}")
 
             # Convert back to bytes
             buffered = BytesIO()
             img.save(buffered, format="PNG")
             return base64.b64encode(buffered.getvalue()).decode("utf-8")
     except Exception as e:
-        print("Image fetch error:", e)
+        logger.exception("Image generation failed")
 
     return None
 
@@ -130,40 +141,151 @@ def get_client_key(email=None):
 
 # ── VPN / Proxy Detection ─────────────────────────────
 def is_vpn_or_proxy():
-    ip = request.remote_addr or ""
-    headers = request.headers
+    """
+    Lightweight abuse protection.
+    Blocks malformed forwarded IP chains and suspicious proxy headers.
+    Keeps Render/Netlify/CDN traffic compatible.
+    """
 
-    # Common proxy/VPN indicators
-    proxy_headers = [
-        "X-Forwarded-For",
+    ip = request.remote_addr or ""
+
+    # Allow localhost/private development
+    private_prefixes = (
+        "127.",
+        "10.",
+        "172.",
+        "192.168"
+    )
+
+    if ip.startswith(private_prefixes):
+        return False
+
+    forwarded = request.headers.get("X-Forwarded-For", "")
+
+    # Suspiciously large forwarded chain
+    if len(forwarded) > 200:
+        return True
+
+    suspicious_headers = [
         "Via",
-        "X-Real-IP",
-        "Forwarded"
+        "X-Proxy-ID",
+        "X-Forwarded-Host"
     ]
 
-    for h in proxy_headers:
-        if headers.get(h):
+    for header in suspicious_headers:
+        value = request.headers.get(header)
+
+        if value and len(value) > 120:
             return True
 
-    # Basic datacenter/VPN IP patterns (simple heuristic)
-    if ip.startswith("10.") or ip.startswith("172.") or ip.startswith("192.168"):
-        return False  # local/private, allow
-
-    # If IP looks unusual (fallback check)
-    if ip.count(".") != 3:
+    # Malformed IPv4 detection
+    if ip and ip.count(".") != 3:
         return True
 
     return False
 
+ # ── In-memory rate limiting ─────────────────────────────
+
+rate_limit_store = defaultdict(list)
+last_rate_cleanup = 0
+RATE_LIMIT_CLEANUP_INTERVAL = 60 * 30  # every 30 minutes
+
+# ── Gemini Model Health Tracking ─────────────────────────────
+model_health = {}
+MODEL_FAILURE_COOLDOWN = 60 * 5  # 5 minutes
+
+RATE_LIMITS = {
+    "guest": {
+        "window": 60 * 60,
+        "limit": 12
+    },
+    "auth": {
+        "window": 60,
+        "limit": 40
+    },
+    "image": {
+        "window": 60 * 10,
+        "limit": 10
+    },
+    "password_reset": {
+        "window": 60 * 15,
+        "limit": 5
+    }
+}
+
+
+
+MAX_PROMPT_LENGTH = 8000
+SESSION_EXPIRY_DAYS = 7
+
+# ── User data validation limits ─────────────────────────────
+MAX_NAME_LENGTH = 80
+MAX_EMAIL_LENGTH = 254
+PASSWORD_MIN_LENGTH = 8
+
+# ── Basic moderation filters ──────────────────────────
+BLOCKED_PATTERNS = [
+    "child porn",
+    "cp content",
+    "extremist manifesto",
+    "terrorist propaganda",
+    "make a bomb",
+    "credit card dump",
+    "steal passwords",
+    "malware builder",
+    "ransomware code"
+]
+
+
+# ─────────────────────────────────────────────────────────────
+def sanitize_text(value: str, max_length: int = 5000) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    value = value.strip()
+
+    # Remove dangerous control characters
+    value = re.sub(r"[\x00-\x1f\x7f]", "", value)
+
+    return value[:max_length]
+
+
+def is_valid_email(email: str) -> bool:
+    pattern = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+    return bool(re.fullmatch(pattern, email or ""))
+# ── Flask App Initialization and CORS ────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev_secret")
-FRONTEND_SECRET = os.environ.get("FRONTEND_SECRET", "")
+
+# ── Request size protection ───────────────────────────
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
+
+SECRET_KEY = os.environ.get("SECRET_KEY")
+
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required")
+
+app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE="Lax"
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7)
 )
-CORS(app, resources={r"/*": {"origins": os.environ.get("FRONTEND_URL", "*")}})
+
+frontend_origin = os.environ.get("FRONTEND_URL")
+
+if not frontend_origin:
+    raise RuntimeError("FRONTEND_URL environment variable is required")
+
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": [frontend_origin]
+        }
+    },
+    supports_credentials=True
+)
 
 # ── Google OAuth setup ───────────────────────────────────────
 oauth = OAuth(app)
@@ -180,18 +302,41 @@ google = oauth.register(
 )
 
 # ── Config ────────────────────────────────────────────────────
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-# Two competing models — fastest valid response wins; other is fallback
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Internal AI routing models
 _GROQ_MODELS    = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "llama-3.1-8b-instant",
 ]
 REQUEST_TIMEOUT = int(os.environ.get("PROMETIX_TIMEOUT", "30"))
 
+# SMTP/Email configuration
 SMTP_SERVER = "smtp.zoho.in"
 SMTP_PORT = 587
 EMAIL_ADDRESS = "admin@atimosai.com"
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+
+# ── Required environment validation ───────────────────
+REQUIRED_ENV_VARS = {
+    "DATABASE_URL": os.environ.get("DATABASE_URL"),
+    "SECRET_KEY": os.environ.get("SECRET_KEY"),
+    "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY"),
+    "EMAIL_PASSWORD": EMAIL_PASSWORD,
+    "GOOGLE_CLIENT_ID": os.environ.get("GOOGLE_CLIENT_ID"),
+    "GOOGLE_CLIENT_SECRET": os.environ.get("GOOGLE_CLIENT_SECRET")
+}
+
+missing_env = [
+    key for key, value in REQUIRED_ENV_VARS.items()
+    if not value
+]
+
+if missing_env:
+    missing_text = ", ".join(missing_env)
+    logger.critical(f"Missing required environment variables: {missing_text}")
+    raise RuntimeError(
+        f"Missing required environment variables: {missing_text}"
+    )
 # ── Gemini Setup ─────────────────────────────────────────────
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -208,11 +353,14 @@ def send_email(to_email, subject, message):
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.send_message(msg)
             server.quit()
+            logger.info(f"Email sent successfully to {to_email}")
         except Exception as e:
-            print("Email error:", e)
+            logger.warning(
+                f"Email delivery failed | recipient={to_email} | error={e}"
+            )
 
-    import threading
-    threading.Thread(target=_send).start()
+    email_thread = threading.Thread(target=_send, daemon=True)
+    email_thread.start()
 
 
 # ── PostgreSQL setup ──────────────────────────────────────────────
@@ -222,7 +370,8 @@ def _get_conn():
         raise Exception("DATABASE_URL environment variable not set")
     return psycopg2.connect(
         db_url,
-        sslmode="require"
+        sslmode="require",
+        connect_timeout=10
     )
 
 @contextmanager
@@ -240,12 +389,19 @@ def db():
 
 # ── Token helpers ─────────────────────────────────────────────
 def _issue_token(email: str) -> str:
-    token = str(uuid.uuid4())
+    token = uuid.uuid4().hex
     ts    = datetime.datetime.utcnow().isoformat()
+    expires_at = (
+        datetime.datetime.utcnow() +
+        datetime.timedelta(days=SESSION_EXPIRY_DAYS)
+    ).isoformat()
     with db() as cur:
         cur.execute(
-            "INSERT INTO sessions (token, email, created_at) VALUES (%s, %s, %s)",
-            (token, email, ts)
+            """
+            INSERT INTO sessions (token, email, created_at, expires_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (token, email, ts, expires_at)
         )
     return token
 
@@ -254,11 +410,68 @@ def _validate_token():
     if not auth_header.startswith("Bearer "):
         return None, (jsonify({"error": "Session expired. Please sign in again.", "code": "TOKEN_MISSING"}), 401)
     token = auth_header[len("Bearer "):].strip()
+
+    # Basic token validation
+    if len(token) < 20:
+        return None, (
+            jsonify({
+                "error": "Invalid session token.",
+                "code": "TOKEN_INVALID"
+            }),
+            401
+        )
     with db() as cur:
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (token,))
+        cur.execute(
+            "SELECT email, created_at, expires_at FROM sessions WHERE token = %s",
+            (token,)
+        )
         row = cur.fetchone()
     if not row:
         return None, (jsonify({"error": "Session expired. Please sign in again.", "code": "TOKEN_INVALID"}), 401)
+
+    try:
+        created_at = row[1]
+        expires_at = row[2]
+
+        if created_at:
+            created_dt = datetime.datetime.fromisoformat(str(created_at))
+
+            if (datetime.datetime.utcnow() - created_dt).days >= 30:
+                with db() as cur:
+                    cur.execute(
+                        "DELETE FROM sessions WHERE token = %s",
+                        (token,)
+                    )
+
+                return None, (
+                    jsonify({
+                        "error": "Session expired. Please sign in again.",
+                        "code": "SESSION_EXPIRED"
+                    }),
+                    401
+                )
+
+        if expires_at:
+            expiry_dt = datetime.datetime.fromisoformat(str(expires_at))
+
+            if datetime.datetime.utcnow() > expiry_dt:
+                with db() as cur:
+                    cur.execute(
+                        "DELETE FROM sessions WHERE token = %s",
+                        (token,)
+                    )
+
+                return None, (
+                    jsonify({
+                        "error": "Session expired. Please sign in again.",
+                        "code": "SESSION_EXPIRED"
+                    }),
+                    401
+                )
+
+    except Exception as e:
+        logger.warning(f"Session expiry validation failed: {e}")
+
     return row[0], None
 
 # ── Admin required decorator ─────────────────────────────
@@ -273,7 +486,16 @@ def admin_required(f):
             cur.execute("SELECT role FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
         if not user or user[0] != "admin":
-            return jsonify({"error": "Forbidden"}), 403
+            logger.warning(
+                f"Unauthorized admin access attempt | email={email} | ip={request.remote_addr}"
+            )
+            return jsonify({
+                "error": "Forbidden",
+                "code": "ADMIN_FORBIDDEN"
+            }), 403
+        logger.info(
+            f"Admin access granted | email={email} | path={request.path}"
+        )
         return f(*args, **kwargs)
     return wrapper
 
@@ -289,6 +511,7 @@ def _public_profile(row) -> dict:
         "provider": row[4],
         "consent": bool(row[5]),
         "created_at": row[7],
+        "is_admin": row[9] == "admin" if len(row) > 9 else False
     }
 
 # ── System prompt ─────────────────────────────────────────────
@@ -387,7 +610,8 @@ def call_groq(user_message: str) -> str:
     If both fail, raise the last error.
     """
     if not GROQ_API_KEY:
-        raise Exception("GROQ_API_KEY environment variable is not set.")
+        logger.warning("GROQ_API_KEY missing — using Gemini-only pipeline")
+        return user_message
 
     intent       = detect_intent(user_message)
     style        = get_prompt_style(intent, user_message)
@@ -428,18 +652,18 @@ def call_groq(user_message: str) -> str:
 
 # ── Gemini Function ──────────────────────────────────────────
 # ── Gemini Function ──────────────────────────────────────────
-def call_gemini(prompt: str, model_choice: str = "3.1-pro"):
+def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
     # ── Dynamic Fallback Chains ─────────────────────────
     fallback_chains = {
-        "3.1-pro": [
-            "gemini-3.1-pro",
-            "gemini-3.1-flash",
+        "2.5-pro": [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
             "gemini-1.5-pro",
             "gemini-1.5-flash"
         ],
 
-        "3.1-flash": [
-            "gemini-3.1-flash",
+        "2.5-flash": [
+            "gemini-2.5-flash",
             "gemini-1.5-flash"
         ],
 
@@ -458,6 +682,23 @@ def call_gemini(prompt: str, model_choice: str = "3.1-pro"):
         ["gemini-1.5-flash"]
     )
 
+    # ── Smart health-based routing ─────────────────────
+    now_ts = time()
+
+    filtered_chain = []
+
+    for model in model_chain:
+        failed_until = model_health.get(model, 0)
+
+        if now_ts >= failed_until:
+            filtered_chain.append(model)
+
+    # fallback if all models temporarily unhealthy
+    if not filtered_chain:
+        filtered_chain = model_chain
+
+    model_chain = filtered_chain
+
     used_fallback = False
     attempted_models = []
 
@@ -465,10 +706,25 @@ def call_gemini(prompt: str, model_choice: str = "3.1-pro"):
         try:
             attempted_models.append(model_name)
 
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+            # Retry each Gemini model once before fallback
+            for attempt in range(2):
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
+                    break
+                except Exception as retry_error:
+                    if attempt == 1:
+                        raise retry_error
 
+                    logger.warning(
+                        f"Retrying Gemini model ({model_name}) after temporary failure"
+                    )
+
+            if not response:
+                raise Exception("Empty Gemini response")
             if response and hasattr(response, "text") and response.text:
+                # Mark healthy again after successful response
+                model_health[model_name] = 0
                 return {
                     "text": response.text.strip(),
                     "usedFallback": idx > 0,
@@ -477,7 +733,11 @@ def call_gemini(prompt: str, model_choice: str = "3.1-pro"):
                 }
 
         except Exception as e:
-            print(f"Gemini model failed ({model_name}):", e)
+            logger.warning(f"Gemini model failed ({model_name}): {e}")
+
+            # Mark temporarily unhealthy
+            model_health[model_name] = time() + MODEL_FAILURE_COOLDOWN
+
             used_fallback = True
             continue
 
@@ -505,9 +765,6 @@ def home():
 # ── Generate ─────────────────────────────────────────────────
 @app.route("/generate-x7k9A2", methods=["POST"])
 def generate():
-    # ── Frontend Secret Verification ─────────────────────
-    if request.headers.get("X-APP-SECRET") != FRONTEND_SECRET:
-        return jsonify({"error": "Unauthorized access"}), 403
     email, err = _validate_token()
     # Allow guest users (no login required)
     if err:
@@ -515,6 +772,30 @@ def generate():
 
     client_key = get_client_key(email)
     now = time()
+
+    # ── Periodic rate-limit cleanup ────────────────────
+    global last_rate_cleanup
+
+    if now - last_rate_cleanup > RATE_LIMIT_CLEANUP_INTERVAL:
+        try:
+            stale_keys = []
+
+            for key, timestamps in rate_limit_store.items():
+                fresh = [t for t in timestamps if now - t < 60 * 60 * 24]
+
+                if fresh:
+                    rate_limit_store[key] = fresh
+                else:
+                    stale_keys.append(key)
+
+            for key in stale_keys:
+                rate_limit_store.pop(key, None)
+
+            last_rate_cleanup = now
+            logger.info("Rate-limit store cleanup completed")
+
+        except Exception as e:
+            logger.warning(f"Rate-limit cleanup failed: {e}")
 
     # Ensure device_id cookie is always set (anti-incognito persistence)
     device_cookie = request.cookies.get("device_id")
@@ -532,8 +813,8 @@ def generate():
 
     # ── Guest usage limits ─────────────────────────────
     if not email:
-        window = 60 * 60  # 1 hour
-        limit = 2
+        window = RATE_LIMITS["guest"]["window"]
+        limit = RATE_LIMITS["guest"]["limit"]
 
         if client_key not in rate_limit_store:
             rate_limit_store[client_key] = []
@@ -545,7 +826,7 @@ def generate():
 
         if len(rate_limit_store[client_key]) >= limit:
             resp = jsonify({
-                "error": "Guest limit reached (2 prompts/hour). Please login to continue.",
+                "error": "Guest limit reached (12 prompts/hour). Please login to continue.",
                 "code": "GUEST_LIMIT"
             })
             resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
@@ -553,13 +834,54 @@ def generate():
 
         rate_limit_store[client_key].append(now)
 
+    # ── General request rate limiting ─────────────────────
+    auth_limit = RATE_LIMITS["auth"]
+
+    if client_key not in rate_limit_store:
+        rate_limit_store[client_key] = []
+
+    rate_limit_store[client_key] = [
+        t for t in rate_limit_store[client_key]
+        if now - t < auth_limit["window"]
+    ]
+
+    if len(rate_limit_store[client_key]) >= auth_limit["limit"]:
+        resp = jsonify({
+            "error": "Too many requests. Please slow down.",
+            "code": "RATE_LIMITED"
+        })
+        resp.set_cookie(
+            "device_id",
+            device_cookie,
+            max_age=60*60*24*30,
+            httponly=True,
+            samesite="Lax"
+        )
+        return resp, 429
+
+    rate_limit_store[client_key].append(now)
+
     data = request.get_json(silent=True)
+
+    # ── Request type validation ────────────────────────
+    if request.content_type and "application/json" not in request.content_type:
+        return jsonify({
+            "error": "Unsupported content type.",
+            "code": "INVALID_CONTENT_TYPE"
+        }), 415
+
     if not data:
         return jsonify({"error": "Invalid JSON in request body."}), 400
 
-    user_message = (data.get("message") or "").strip()
+    user_message = sanitize_text(
+        data.get("message") or "",
+        MAX_PROMPT_LENGTH
+    )
+
+    # Normalize whitespace spam
+    user_message = " ".join(user_message.split())
     image_mode = is_image_request(user_message)
-    model_choice = (data.get("model") or "3.1-pro").lower()
+    model_choice = (data.get("model") or "2.5-flash").lower()
     mode = (data.get("mode") or "prompt").lower()
     # ── Restrict AI features for guests ─────────────────────────
     if not email and mode == "gemini":
@@ -570,8 +892,36 @@ def generate():
     if not user_message:
         return jsonify({"error": "Message cannot be empty."}), 400
 
+    # ── Basic moderation filter ───────────────────────
+    lowered_message = user_message.lower()
+
+    for blocked in BLOCKED_PATTERNS:
+        if blocked in lowered_message:
+            logger.warning(
+                f"Blocked unsafe prompt | ip={request.remote_addr} | pattern={blocked}"
+            )
+
+            return jsonify({
+                "error": "This request violates usage policies.",
+                "code": "PROMPT_BLOCKED"
+            }), 403
+
+    # Repeated-character spam protection
+    if len(set(user_message)) <= 2 and len(user_message) > 30:
+        return jsonify({
+            "error": "Spam-like input detected.",
+            "code": "SPAM_DETECTED"
+        }), 400
+
+    # ── Prompt length protection ─────────────────────────
+    if len(user_message) > MAX_PROMPT_LENGTH:
+        return jsonify({
+            "error": "Prompt too large. Please shorten your message.",
+            "code": "PROMPT_TOO_LARGE"
+        }), 413
+
     # Gemini Pro limit: 5 requests per 5 hours per user
-    if model_choice == "3.1-pro":
+    if model_choice == "2.5-pro":
         window_seconds = 5 * 60 * 60
         now_ts = int(time())
 
@@ -606,6 +956,21 @@ def generate():
 
         # Step 2: If user wants only prompt
         if mode == "prompt":
+            # Save generation history
+            if email:
+                try:
+                    ts = datetime.datetime.utcnow().isoformat()
+
+                    with db() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO generations (email, input, output, ts)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (email, user_message, improved_prompt, ts)
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to save generation history: {e}")
             resp = jsonify({
                 "type": "prompt",
                 "response": improved_prompt,
@@ -616,8 +981,55 @@ def generate():
 
         # Step 3: If user selected Gemini
         if mode == "gemini":
+            # ── Image generation rate limit ─────────────────
             if image_mode:
+                image_limit = RATE_LIMITS["image"]
+                image_key = f"image:{client_key}"
+
+                if image_key not in rate_limit_store:
+                    rate_limit_store[image_key] = []
+
+                rate_limit_store[image_key] = [
+                    t for t in rate_limit_store[image_key]
+                    if now - t < image_limit["window"]
+                ]
+
+                if len(rate_limit_store[image_key]) >= image_limit["limit"]:
+                    return jsonify({
+                        "error": "Image generation limit reached. Please try again later.",
+                        "code": "IMAGE_RATE_LIMIT"
+                    }), 429
+
+                rate_limit_store[image_key].append(now)
                 image_data = generate_image(improved_prompt)
+
+                if not image_data:
+                    return jsonify({
+                        "error": "Image generation temporarily unavailable.",
+                        "code": "IMAGE_GENERATION_FAILED"
+                    }), 502
+
+                # Save image generation history
+                if email:
+                    try:
+                        ts = datetime.datetime.utcnow().isoformat()
+
+                        with db() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO generations (email, input, output, ts)
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                                (
+                                    email,
+                                    user_message,
+                                    "[IMAGE GENERATED]",
+                                    ts
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to save image history: {e}")
+
                 resp = jsonify({
                     "type": "image",
                     "image": image_data,
@@ -627,6 +1039,27 @@ def generate():
                 return resp
             else:
                 gemini_result = call_gemini(improved_prompt, model_choice)
+
+                # Save Gemini response history
+                if email:
+                    try:
+                        ts = datetime.datetime.utcnow().isoformat()
+
+                        with db() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO generations (email, input, output, ts)
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                                (
+                                    email,
+                                    user_message,
+                                    gemini_result["text"],
+                                    ts
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to save Gemini history: {e}")
 
                 resp = jsonify({
                     "type": "text",
@@ -638,7 +1071,12 @@ def generate():
                 resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
                 return resp
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        logger.exception("Generate endpoint failure")
+
+        return jsonify({
+            "error": "AI service temporarily unavailable.",
+            "code": "AI_BACKEND_ERROR"
+        }), 502
 
     # Fallback if mode is not recognized
     return jsonify({"error": "Invalid mode or configuration."}), 400
@@ -646,17 +1084,20 @@ def generate():
 # ── Auth: register ────────────────────────────────────────────
 @app.route("/auth/register", methods=["POST"])
 def auth_register():
-    body     = request.get_json(silent=True) or {}
-    name     = (body.get("name")     or "").strip()
-    email    = (body.get("email")    or "").strip().lower()
+    body = request.get_json(silent=True) or {}
+    name = sanitize_text(body.get("name") or "", MAX_NAME_LENGTH)
+    email = sanitize_text(body.get("email") or "", MAX_EMAIL_LENGTH).lower()
     password = (body.get("password") or "").strip()
 
     if not name:
         return jsonify({"error": "Name is required."}), 400
-    if not email or "@" not in email:
+    if not email or not is_valid_email(email):
         return jsonify({"error": "A valid email address is required."}), 400
-    if len(password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters."}), 400
+
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return jsonify({
+            "error": f"Password must be at least {PASSWORD_MIN_LENGTH} characters."
+        }), 400
 
     ts = datetime.datetime.utcnow().isoformat()
     try:
@@ -671,9 +1112,14 @@ def auth_register():
                 (email, name, generate_password_hash(password), name[0].upper(), False, 0, ts, ts)
             )
     except Exception as e:
-        return jsonify({"error": f"Registration failed: {str(e)}"}), 500
+        logger.exception("User registration failed")
 
-    print(f"  [REGISTER] {email}  —  {ts}")
+        return jsonify({
+            "error": "Registration temporarily unavailable.",
+            "code": "REGISTER_ERROR"
+        }), 500
+
+    logger.info(f"REGISTER | {email} | {ts}")
     send_email(
         "admin@atimosai.com",
         "New User Registered",
@@ -689,12 +1135,34 @@ def auth_register():
 # ── Auth: login ───────────────────────────────────────────────
 @app.route("/auth/login", methods=["POST"])
 def auth_login():
-    body     = request.get_json(silent=True) or {}
-    email    = (body.get("email")    or "").strip().lower()
+    body = request.get_json(silent=True) or {}
+    email = sanitize_text(body.get("email") or "", MAX_EMAIL_LENGTH).lower()
     password = (body.get("password") or "").strip()
 
     if not email or not password:
         return jsonify({"error": "Email and password are required."}), 400
+
+    # ── Login abuse protection ─────────────────────────
+    client_key = get_client_key(email)
+    now = time()
+
+    login_limit_key = f"login:{client_key}"
+
+    if login_limit_key not in rate_limit_store:
+        rate_limit_store[login_limit_key] = []
+
+    rate_limit_store[login_limit_key] = [
+        t for t in rate_limit_store[login_limit_key]
+        if now - t < 60
+    ]
+
+    if len(rate_limit_store[login_limit_key]) >= 10:
+        return jsonify({
+            "error": "Too many login attempts. Please wait a minute.",
+            "code": "LOGIN_RATE_LIMIT"
+        }), 429
+
+    rate_limit_store[login_limit_key].append(now)
 
     with db() as cur:
         cur.execute("SELECT * FROM users WHERE email = %s", (email,))
@@ -727,7 +1195,7 @@ def auth_login():
         user = cur.fetchone()
 
     token = _issue_token(email)
-    print(f"  [LOGIN]  {email}  —  {ts}")
+    logger.info(f"LOGIN | {email} | {ts}")
     # Send login notification email
     send_email(
         "admin@atimosai.com",
@@ -752,10 +1220,33 @@ import random
 @app.route("/auth/forgot-password", methods=["POST"])
 def forgot_password():
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    email = sanitize_text(data.get("email") or "", MAX_EMAIL_LENGTH).lower()
 
     if not email:
         return jsonify({"error": "Email required"}), 400
+
+    # ── Password reset abuse protection ────────────────
+    client_key = get_client_key(email)
+    now = time()
+
+    reset_limit = RATE_LIMITS["password_reset"]
+    reset_key = f"reset:{client_key}"
+
+    if reset_key not in rate_limit_store:
+        rate_limit_store[reset_key] = []
+
+    rate_limit_store[reset_key] = [
+        t for t in rate_limit_store[reset_key]
+        if now - t < reset_limit["window"]
+    ]
+
+    if len(rate_limit_store[reset_key]) >= reset_limit["limit"]:
+        return jsonify({
+            "error": "Too many reset requests. Please try again later.",
+            "code": "RESET_RATE_LIMIT"
+        }), 429
+
+    rate_limit_store[reset_key].append(now)
     with db() as cur:
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
@@ -784,10 +1275,33 @@ def forgot_password():
 @app.route("/auth/send-reset-link", methods=["POST"])
 def send_reset_link():
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    email = sanitize_text(data.get("email") or "", MAX_EMAIL_LENGTH).lower()
 
     if not email:
         return jsonify({"error": "Email required"}), 400
+
+    # ── Reset link abuse protection ────────────────────
+    client_key = get_client_key(email)
+    now = time()
+
+    reset_limit = RATE_LIMITS["password_reset"]
+    reset_key = f"reset-link:{client_key}"
+
+    if reset_key not in rate_limit_store:
+        rate_limit_store[reset_key] = []
+
+    rate_limit_store[reset_key] = [
+        t for t in rate_limit_store[reset_key]
+        if now - t < reset_limit["window"]
+    ]
+
+    if len(rate_limit_store[reset_key]) >= reset_limit["limit"]:
+        return jsonify({
+            "error": "Too many reset requests. Please try again later.",
+            "code": "RESET_RATE_LIMIT"
+        }), 429
+
+    rate_limit_store[reset_key].append(now)
 
     with db() as cur:
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
@@ -819,14 +1333,16 @@ def send_reset_link():
 @app.route("/auth/reset-password", methods=["POST"])
 def reset_password():
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    otp = (data.get("otp") or "").strip()
+    email = sanitize_text(data.get("email") or "", MAX_EMAIL_LENGTH).lower()
+    otp = sanitize_text(data.get("otp") or "", 12)
     new_password = (data.get("new_password") or "").strip()
 
     if not email or not otp or not new_password:
         return jsonify({"error": "Missing fields"}), 400
-    if len(new_password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if len(new_password) < PASSWORD_MIN_LENGTH:
+        return jsonify({
+            "error": f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
+        }), 400
 
     with db() as cur:
         cur.execute(
@@ -860,7 +1376,7 @@ def user_consent():
     consent = 1 if body.get("consent") else 0
     with db() as cur:
         cur.execute("UPDATE users SET consent = %s WHERE email = %s", (consent, email))
-    print(f"  [CONSENT] {email}  ->  {'YES' if consent else 'NO'}")
+    logger.info(f"CONSENT | {email} | {'YES' if consent else 'NO'}")
     return jsonify({"status": "ok"})
 
 # ── User: search log ─────────────────────────────────────────
@@ -870,9 +1386,16 @@ def user_search():
     if err:
         return err
     body  = request.get_json(silent=True) or {}
-    query = (body.get("query") or "").strip()
+    query = sanitize_text(body.get("query") or "", 1000)
     if not query:
         return jsonify({"status": "ignored"})
+
+    if len(query) > 1000:
+        return jsonify({
+            "error": "Search query too long.",
+            "code": "SEARCH_TOO_LONG"
+        }), 413
+
     ts = datetime.datetime.utcnow().isoformat()
     with db() as cur:
         cur.execute("INSERT INTO searches (email, query, ts) VALUES (%s, %s, %s)", (email, query, ts))
@@ -887,11 +1410,23 @@ def user_feedback():
         return err
 
     data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
+    message = sanitize_text(data.get("message") or "", 2000)
     rating = int(data.get("rating") or 0)
+
+    # Clamp invalid ratings
+    if rating < 0:
+        rating = 0
+    if rating > 5:
+        rating = 5
 
     if not message:
         return jsonify({"error": "Message cannot be empty"}), 400
+
+    if len(message) > 2000:
+        return jsonify({
+            "error": "Feedback message too long.",
+            "code": "FEEDBACK_TOO_LONG"
+        }), 413
 
     ts = datetime.datetime.utcnow().isoformat()
 
@@ -932,10 +1467,17 @@ def training_pair():
     if err:
         return err
     body = request.get_json(silent=True) or {}
-    inp  = (body.get("input")  or "").strip()
-    out  = (body.get("output") or "").strip()
+    inp = sanitize_text(body.get("input") or "", 4000)
+    out = sanitize_text(body.get("output") or "", 12000)
     if not inp or not out:
         return jsonify({"status": "ignored"})
+
+    if len(inp) > 4000 or len(out) > 12000:
+        return jsonify({
+            "error": "Training data too large.",
+            "code": "TRAINING_TOO_LARGE"
+        }), 413
+
     with db() as cur:
         cur.execute("SELECT consent FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
@@ -952,12 +1494,19 @@ def training_pair():
 # ── Google OAuth ─────────────────────────────────────────────
 @app.route("/auth/google")
 def google_login():
-    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "https://prometix-backend.onrender.com/google-callback")
+    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
+
+    if not redirect_uri:
+        logger.error("GOOGLE_REDIRECT_URI is missing")
+        return jsonify({
+            "error": "OAuth configuration unavailable.",
+            "code": "OAUTH_CONFIG_ERROR"
+        }), 500
     return google.authorize_redirect(redirect_uri)
 
 @app.route("/google-callback")
 def google_callback():
-    print("Google callback triggered")
+    logger.info("Google OAuth callback triggered")
     try:
         token = google.authorize_access_token()
         user_info = google.get("userinfo", token=token).json()
@@ -966,7 +1515,10 @@ def google_callback():
         name = user_info.get("name")
 
         if not email or not name:
-            return "Google authentication failed: missing user data", 400
+            return jsonify({
+                "error": "Google authentication failed.",
+                "code": "GOOGLE_USERDATA_MISSING"
+            }), 400
 
         ts = datetime.datetime.utcnow().isoformat()
 
@@ -987,7 +1539,12 @@ def google_callback():
                         (ts, email)
                     )
         except Exception as e:
-            return f"Database error during Google login: {str(e)}", 500
+            logger.exception("Database error during Google login")
+
+            return jsonify({
+                "error": "Account login failed.",
+                "code": "GOOGLE_DB_ERROR"
+            }), 500
 
         session_token = _issue_token(email)
         # Send login notification email for Google login
@@ -998,15 +1555,18 @@ def google_callback():
                 f"User: {email}\nName: {name}\nTime: {ts}\nMethod: Google OAuth"
             )
         except Exception as e:
-            print("Google login email error:", e)
+            logger.warning(f"Google login email error: {e}")
 
         frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com")
         return redirect(f"{frontend_url}/login.html?token={session_token}&name={name}&email={email}")
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return f"Google Auth Error: {str(e)}", 500
+        logger.exception("Google OAuth callback failure")
+
+        return jsonify({
+            "error": "Google authentication failed.",
+            "code": "GOOGLE_AUTH_ERROR"
+        }), 500
 
 
 # ── Security Headers ─────────────────────────────────────────
@@ -1015,24 +1575,37 @@ def secure_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "img-src 'self' data:; "
-        "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline';"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(self), geolocation=(), payment=()"
     )
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Strict-Transport-Security"] = (
+        "max-age=31536000; includeSubDomains"
+    )
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self' https: data: blob:; "
+        "img-src 'self' https: data: blob:; "
+        "script-src 'self' 'unsafe-inline' https:; "
+        "style-src 'self' 'unsafe-inline' https:; "
+        "font-src 'self' https: data:; "
+        "connect-src 'self' https:; "
+        "frame-ancestors 'none';"
+    )
+    # Prevent caching of sensitive endpoints
+    if request.path.startswith("/auth") or request.path.startswith("/generate"):
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, private"
+        )
+        response.headers["Pragma"] = "no-cache"
     return response
 
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n  ╔══════════════════════════════════════════╗")
-    print("  ║   Prometix by Atimos AI  —  v3.0         ║")
-    print("  ║   Mode : Prompt Engineering Tool         ║")
-    print("  ╚══════════════════════════════════════════╝")
-    print(f"\n  AI backend  : Groq API (dual-model, race mode)")
-    print("  DB          : Supabase PostgreSQL")
-    print(f"  Endpoints   : /auth/register  /auth/login  /auth/logout  /generate")
-    print(f"  Security    : bcrypt hashing  UUID tokens  PostgreSQL\n")
+    logger.info("Prometix backend starting")
+    logger.info(f"AI backend initialized with {len(_GROQ_MODELS)} Groq models")
+    logger.info("Database: Supabase PostgreSQL")
+    logger.info("Security systems initialized")
     port = int(os.environ.get("PORT", 10000))
-    print(f"Running on 0.0.0.0:{port}")
+    logger.info(f"Running on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
