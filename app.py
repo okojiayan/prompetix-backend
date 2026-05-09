@@ -371,11 +371,16 @@ frontend_origin = os.environ.get("FRONTEND_URL")
 if not frontend_origin:
     raise RuntimeError("FRONTEND_URL environment variable is required")
 
+# Support optional test origin (e.g. random Netlify preview URL)
+frontend_origin_test = os.environ.get("FRONTEND_URL_TEST", "")
+
+allowed_origins = [o for o in [frontend_origin, frontend_origin_test] if o]
+
 CORS(
     app,
     resources={
         r"/*": {
-            "origins": [frontend_origin]
+            "origins": allowed_origins
         }
     },
     supports_credentials=True
