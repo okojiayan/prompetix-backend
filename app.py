@@ -61,24 +61,64 @@ def is_image_request(text: str) -> bool:
     keywords = ["image", "photo", "picture", "generate image", "create image", "art", "illustration", "logo"]
     return any(k in t for k in keywords)
 
+# ── Audio request helper ────────────────────────────────────
+def is_audio_request(text: str) -> bool:
+    t = text.lower()
+
+    keywords = [
+        "audio",
+        "voice",
+        "speech",
+        "tts",
+        "text to speech",
+        "music",
+        "song",
+        "sound effect",
+        "podcast",
+        "narration",
+        "generate audio",
+        "create audio"
+    ]
+
+    return any(k in t for k in keywords)
+
 # ── Pollinations image generator ─────────────────────────────
-def generate_image(prompt: str) -> str:
+def generate_image(prompt: str, model: str = "gptimage") -> str:
     """
-    Generate image and return base64 so frontend can render directly
+    Generate image using Pollinations API and return base64.
     """
+
     import urllib.parse
     import base64
 
     encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}"
+
+    # ── Pollinations API Key ─────────────────────────
+    pollinations_key = os.environ.get("POLLINATIONS_API_KEY")
+
+    headers = {}
+
+    if pollinations_key:
+        headers["Authorization"] = f"Bearer {pollinations_key}"
+
+    # ── Model Routing ────────────────────────────────
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?model={model}&width=1024&height=1024"
+        f"&enhance=true&safe=true&nologo=true"
+    )
 
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=40
+        )
+
         if response.status_code == 200:
             from PIL import Image, ImageDraw, ImageFont
             from io import BytesIO
 
-            # Load image
             img = Image.open(BytesIO(response.content)).convert("RGBA")
 
             # ── Logo Watermark (Prometix) ─────────────────────
@@ -88,35 +128,89 @@ def generate_image(prompt: str) -> str:
                 logo_path = os.path.join(os.path.dirname(__file__), "watermark.png")
                 logo = Image.open(logo_path).convert("RGBA")
 
-                # Resize logo based on image size (responsive)
                 base_width = int(img.width * 0.15)
                 ratio = base_width / logo.width
                 new_size = (base_width, int(logo.height * ratio))
                 logo = logo.resize(new_size, Image.LANCZOS)
 
-                # Reduce opacity
                 alpha = logo.split()[3]
                 alpha = ImageEnhance.Brightness(alpha).enhance(0.5)
                 logo.putalpha(alpha)
 
-                # Position (bottom-left, safe from Gemini watermark)
                 margin = 20
                 position = (margin, img.height - logo.height - margin)
 
-                # Paste logo
                 img.paste(logo, position, logo)
 
             except Exception as e:
                 logger.warning(f"Watermark error: {e}")
 
-            # Convert back to bytes
             buffered = BytesIO()
             img.save(buffered, format="PNG")
+
             return base64.b64encode(buffered.getvalue()).decode("utf-8")
-    except Exception as e:
+
+        logger.warning(
+            f"Pollinations image request failed | status={response.status_code}"
+        )
+
+    except Exception:
         logger.exception("Image generation failed")
 
     return None
+
+# ── Pollinations audio generator ───────────────────────────
+def generate_audio(prompt: str, model: str = "elevenlabs-v3"):
+    """
+    Generate audio/music using Pollinations audio models.
+    Returns audio URL if successful.
+    """
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+
+    payload = {
+        "model": model,
+        "prompt": prompt
+    }
+
+    try:
+        response = requests.post(
+            "https://audio.pollinations.ai/generate",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            logger.warning(
+                f"Pollinations audio failed | model={model} | status={response.status_code}"
+            )
+            return None
+
+        result = response.json()
+
+        audio_url = (
+            result.get("audio")
+            or result.get("url")
+            or result.get("audio_url")
+        )
+
+        if not audio_url:
+            logger.warning(
+                f"Pollinations audio returned empty URL | model={model}"
+            )
+            return None
+
+        return audio_url
+
+    except Exception:
+        logger.exception("Audio generation failed")
+        return None
 
 
 def get_client_key(email=None):
@@ -197,7 +291,7 @@ MODEL_FAILURE_COOLDOWN = 60 * 5  # 5 minutes
 RATE_LIMITS = {
     "guest": {
         "window": 60 * 60,
-        "limit": 12
+        "limit": 2
     },
     "auth": {
         "window": 60,
@@ -302,7 +396,11 @@ google = oauth.register(
 )
 
 # ── Config ────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
 # Internal AI routing models
 _GROQ_MODELS    = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -317,8 +415,16 @@ EMAIL_ADDRESS = "admin@atimosai.com"
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 
 # ── Required environment validation ───────────────────
+ # ── Database Routing ──────────────────────────────────
+# Supabase → authentication + users
+# Neon → AI chats + memory + generations
+
+SUPABASE_DATABASE_URL = os.environ.get("DATABASE_URL")
+NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")
+
 REQUIRED_ENV_VARS = {
-    "DATABASE_URL": os.environ.get("DATABASE_URL"),
+    "SUPABASE_DATABASE_URL": SUPABASE_DATABASE_URL,
+    "NEON_DATABASE_URL": NEON_DATABASE_URL,
     "SECRET_KEY": os.environ.get("SECRET_KEY"),
     "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY"),
     "EMAIL_PASSWORD": EMAIL_PASSWORD,
@@ -364,26 +470,61 @@ def send_email(to_email, subject, message):
 
 
 # ── PostgreSQL setup ──────────────────────────────────────────────
-def _get_conn():
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise Exception("DATABASE_URL environment variable not set")
+# Supabase connection → auth/users/sessions
+# Neon connection → chats/history/generations
+
+def _get_auth_conn():
+    if not SUPABASE_DATABASE_URL:
+        raise Exception("SUPABASE DATABASE_URL environment variable not set")
+
     return psycopg2.connect(
-        db_url,
+        SUPABASE_DATABASE_URL,
         sslmode="require",
         connect_timeout=10
     )
 
+
+def _get_chat_conn():
+    if not NEON_DATABASE_URL:
+        raise Exception("NEON_DATABASE_URL environment variable not set")
+
+    return psycopg2.connect(
+        NEON_DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10
+    )
+
+
 @contextmanager
-def db():
-    conn = _get_conn()
+def auth_db():
+    conn = _get_auth_conn()
+
     try:
         cur = conn.cursor()
         yield cur
         conn.commit()
+
     except Exception:
         conn.rollback()
         raise
+
+    finally:
+        conn.close()
+
+
+@contextmanager
+def chat_db():
+    conn = _get_chat_conn()
+
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
     finally:
         conn.close()
 
@@ -395,7 +536,7 @@ def _issue_token(email: str) -> str:
         datetime.datetime.utcnow() +
         datetime.timedelta(days=SESSION_EXPIRY_DAYS)
     ).isoformat()
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute(
             """
             INSERT INTO sessions (token, email, created_at, expires_at)
@@ -420,7 +561,7 @@ def _validate_token():
             }),
             401
         )
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute(
             "SELECT email, created_at, expires_at FROM sessions WHERE token = %s",
             (token,)
@@ -437,7 +578,7 @@ def _validate_token():
             created_dt = datetime.datetime.fromisoformat(str(created_at))
 
             if (datetime.datetime.utcnow() - created_dt).days >= 30:
-                with db() as cur:
+                with auth_db() as cur:
                     cur.execute(
                         "DELETE FROM sessions WHERE token = %s",
                         (token,)
@@ -455,7 +596,7 @@ def _validate_token():
             expiry_dt = datetime.datetime.fromisoformat(str(expires_at))
 
             if datetime.datetime.utcnow() > expiry_dt:
-                with db() as cur:
+                with auth_db() as cur:
                     cur.execute(
                         "DELETE FROM sessions WHERE token = %s",
                         (token,)
@@ -472,6 +613,21 @@ def _validate_token():
     except Exception as e:
         logger.warning(f"Session expiry validation failed: {e}")
 
+    # ── Rolling session refresh ─────────────────────────
+    try:
+        new_expiry = (
+            datetime.datetime.utcnow() +
+            datetime.timedelta(days=SESSION_EXPIRY_DAYS)
+        ).isoformat()
+
+        with auth_db() as cur:
+            cur.execute(
+                "UPDATE sessions SET expires_at = %s WHERE token = %s",
+                (new_expiry, token)
+            )
+
+    except Exception as e:
+        logger.warning(f"Session refresh failed: {e}")
     return row[0], None
 
 # ── Admin required decorator ─────────────────────────────
@@ -482,7 +638,7 @@ def admin_required(f):
         email, err = _validate_token()
         if err:
             return err
-        with db() as cur:
+        with auth_db() as cur:
             cur.execute("SELECT role FROM users WHERE email = %s", (email,))
             user = cur.fetchone()
         if not user or user[0] != "admin":
@@ -500,7 +656,7 @@ def admin_required(f):
     return wrapper
 
 def _invalidate_token(token: str):
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
 
 def _public_profile(row) -> dict:
@@ -748,6 +904,99 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
         "attemptedModels": attempted_models
     }
 
+
+# ── Pollinations Text Function ──────────────────────────────
+def call_pollinations_text(prompt: str, provider: str = "gpt"):
+    """
+    Multi-model Pollinations text routing.
+    """
+
+    provider_map = {
+        "claude": "claude",
+        "gpt": "openai",
+        "gemini": "gemini",
+        "deepseek": "deepseek",
+        "qwen": "qwen-coder",
+        "grok": "grok"
+    }
+
+    selected_model = provider_map.get(provider, "openai")
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+
+    payload = {
+        "model": selected_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(
+            "https://text.pollinations.ai/openai",
+            headers=headers,
+            json=payload,
+            timeout=45
+        )
+
+        if response.status_code != 200:
+            logger.warning(
+                f"Pollinations text failed | model={selected_model} | status={response.status_code}"
+            )
+
+            return {
+                "text": "AI response temporarily unavailable.",
+                "provider": provider,
+                "model": selected_model,
+                "success": False
+            }
+
+        result = response.json()
+
+        text = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        if not text:
+            logger.warning(
+                f"Pollinations empty response | model={selected_model}"
+            )
+
+            return {
+                "text": "AI response temporarily unavailable.",
+                "provider": provider,
+                "model": selected_model,
+                "success": False
+            }
+
+        return {
+            "text": text,
+            "provider": provider,
+            "model": selected_model,
+            "success": True
+        }
+
+    except Exception:
+        logger.exception("Pollinations text generation failed")
+
+        return {
+            "text": "AI response temporarily unavailable.",
+            "provider": provider,
+            "model": selected_model,
+            "success": False
+        }
+
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
@@ -826,7 +1075,7 @@ def generate():
 
         if len(rate_limit_store[client_key]) >= limit:
             resp = jsonify({
-                "error": "Guest limit reached (12 prompts/hour). Please login to continue.",
+                "error": "Free preview completed. Login to continue using Prometix AI.",
                 "code": "GUEST_LIMIT"
             })
             resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
@@ -836,16 +1085,17 @@ def generate():
 
     # ── General request rate limiting ─────────────────────
     auth_limit = RATE_LIMITS["auth"]
+    auth_rate_key = f"auth:{client_key}"
 
-    if client_key not in rate_limit_store:
-        rate_limit_store[client_key] = []
+    if auth_rate_key not in rate_limit_store:
+        rate_limit_store[auth_rate_key] = []
 
-    rate_limit_store[client_key] = [
-        t for t in rate_limit_store[client_key]
+    rate_limit_store[auth_rate_key] = [
+        t for t in rate_limit_store[auth_rate_key]
         if now - t < auth_limit["window"]
     ]
 
-    if len(rate_limit_store[client_key]) >= auth_limit["limit"]:
+    if len(rate_limit_store[auth_rate_key]) >= auth_limit["limit"]:
         resp = jsonify({
             "error": "Too many requests. Please slow down.",
             "code": "RATE_LIMITED"
@@ -859,7 +1109,7 @@ def generate():
         )
         return resp, 429
 
-    rate_limit_store[client_key].append(now)
+    rate_limit_store[auth_rate_key].append(now)
 
     data = request.get_json(silent=True)
 
@@ -881,10 +1131,66 @@ def generate():
     # Normalize whitespace spam
     user_message = " ".join(user_message.split())
     image_mode = is_image_request(user_message)
+    audio_mode = is_audio_request(user_message)
     model_choice = (data.get("model") or "2.5-flash").lower()
     mode = (data.get("mode") or "prompt").lower()
-    # ── Restrict AI features for guests ─────────────────────────
-    if not email and mode == "gemini":
+
+    pollinations_model = (
+        data.get("pollinations_model") or "gptimage"
+    ).lower()
+
+    pollinations_audio_model = (
+        data.get("pollinations_audio_model") or "elevenlabs-v3"
+    ).lower()
+
+    pollinations_provider = (
+        data.get("pollinations_provider") or "gpt"
+    ).lower()
+
+    # ── Allowed AI mode validation ─────────────────────
+    allowed_modes = {"prompt", "gemini", "pollinations"}
+
+    if mode not in allowed_modes:
+        return jsonify({
+            "error": "Invalid AI mode selected.",
+            "code": "INVALID_MODE"
+        }), 400
+
+    # ── Allowed audio models ───────────────────────────
+    allowed_audio_models = {
+        "elevenlabs-v3",
+        "elevenlabs-v2",
+        "elevenlabs-music"
+    }
+
+    if pollinations_audio_model not in allowed_audio_models:
+        pollinations_audio_model = "elevenlabs-v3"
+
+    # ── Allowed Pollinations providers ──────────────────
+    allowed_pollinations_providers = {
+        "claude",
+        "gpt",
+        "gemini",
+        "deepseek",
+        "qwen",
+        "grok"
+    }
+
+    if pollinations_provider not in allowed_pollinations_providers:
+        pollinations_provider = "gpt"
+
+    # ── Allowed Gemini model validation ───────────────
+    allowed_models = {
+        "2.5-pro",
+        "2.5-flash",
+        "1.5-pro",
+        "1.5-flash"
+    }
+
+    if model_choice not in allowed_models:
+        model_choice = "2.5-flash"
+    # ── Restrict premium AI features for guests ─────────────────────────
+    if not email and mode in ["gemini", "pollinations"]:
         return jsonify({
             "error": "Login required to use AI features.",
             "code": "LOGIN_REQUIRED"
@@ -926,7 +1232,7 @@ def generate():
         now_ts = int(time())
 
         if email:
-            with db() as cur:
+            with chat_db() as cur:
                 cur.execute(
                     "SELECT ts FROM generations WHERE email = %s ORDER BY ts DESC LIMIT 20",
                     (email,)
@@ -961,7 +1267,7 @@ def generate():
                 try:
                     ts = datetime.datetime.utcnow().isoformat()
 
-                    with db() as cur:
+                    with chat_db() as cur:
                         cur.execute(
                             """
                             INSERT INTO generations (email, input, output, ts)
@@ -977,6 +1283,188 @@ def generate():
                 "done": True
             })
             resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+            return resp
+
+        # Step 3A: Pollinations AI Mode
+        if mode == "pollinations":
+
+            # ── Audio Mode ─────────────────────────────
+            if audio_mode:
+
+                audio_fallbacks = [
+                    pollinations_audio_model,
+                    "elevenlabs-v3",
+                    "elevenlabs-v2",
+                    "elevenlabs-music"
+                ]
+
+                audio_url = None
+                used_audio_model = None
+
+                for fallback_model in audio_fallbacks:
+                    audio_url = generate_audio(
+                        improved_prompt,
+                        fallback_model
+                    )
+
+                    if audio_url:
+                        used_audio_model = fallback_model
+                        break
+
+                if not audio_url:
+                    return jsonify({
+                        "error": "Audio generation temporarily unavailable.",
+                        "code": "AUDIO_GENERATION_FAILED"
+                    }), 502
+
+                if email:
+                    try:
+                        ts = datetime.datetime.utcnow().isoformat()
+
+                        with chat_db() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO generations (email, input, output, ts)
+                                VALUES (%s, %s, %s, %s)
+                                """,
+                                (
+                                    email,
+                                    user_message,
+                                    "[AUDIO GENERATED]",
+                                    ts
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to save audio history: {e}")
+
+                resp = jsonify({
+                    "type": "audio",
+                    "provider": "elevenlabs",
+                    "model": used_audio_model,
+                    "audio": audio_url,
+                    "done": True
+                })
+
+                resp.set_cookie(
+                    "device_id",
+                    device_cookie,
+                    max_age=60*60*24*30,
+                    httponly=True,
+                    samesite="Lax"
+                )
+
+                return resp
+
+            # ── Pollinations image rate limit ─────────────────
+            if image_mode:
+                image_limit = RATE_LIMITS["image"]
+                image_key = f"pollinations-image:{client_key}"
+
+                if image_key not in rate_limit_store:
+                    rate_limit_store[image_key] = []
+
+                rate_limit_store[image_key] = [
+                    t for t in rate_limit_store[image_key]
+                    if now - t < image_limit["window"]
+                ]
+
+                if len(rate_limit_store[image_key]) >= image_limit["limit"]:
+                    return jsonify({
+                        "error": "Image generation limit reached. Please try again later.",
+                        "code": "IMAGE_RATE_LIMIT"
+                    }), 429
+
+                rate_limit_store[image_key].append(now)
+
+            # ── Image Mode ─────────────────────────────
+            if image_mode:
+                image_fallbacks = [
+                    pollinations_model,
+                    "nanobanana",
+                    "gptimage",
+                    "novacanvas",
+                    "flux"
+                ]
+
+                image_data = None
+                used_image_model = None
+
+                for fallback_model in image_fallbacks:
+                    image_data = generate_image(
+                        improved_prompt,
+                        fallback_model
+                    )
+
+                    if image_data:
+                        used_image_model = fallback_model
+                        break
+
+                if not image_data:
+                    return jsonify({
+                        "error": "Image generation temporarily unavailable.",
+                        "code": "IMAGE_GENERATION_FAILED"
+                    }), 502
+
+                resp = jsonify({
+                    "type": "image",
+                    "provider": "pollinations",
+                    "model": used_image_model,
+                    "image": image_data,
+                    "done": True
+                })
+
+                resp.set_cookie(
+                    "device_id",
+                    device_cookie,
+                    max_age=60*60*24*30,
+                    httponly=True,
+                    samesite="Lax"
+                )
+
+                return resp
+
+            # ── Text Mode ──────────────────────────────
+            ai_result = call_pollinations_text(
+                improved_prompt,
+                pollinations_provider
+            )
+
+            if email:
+                try:
+                    ts = datetime.datetime.utcnow().isoformat()
+
+                    with chat_db() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO generations (email, input, output, ts)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (
+                                email,
+                                user_message,
+                                ai_result["text"],
+                                ts
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to save Pollinations history: {e}")
+
+            resp = jsonify({
+                "type": "text",
+                "provider": ai_result["provider"],
+                "model": ai_result["model"],
+                "response": ai_result["text"],
+                "done": True
+            })
+
+            resp.set_cookie(
+                "device_id",
+                device_cookie,
+                max_age=60*60*24*30,
+                httponly=True,
+                samesite="Lax"
+            )
+
             return resp
 
         # Step 3: If user selected Gemini
@@ -1001,7 +1489,10 @@ def generate():
                     }), 429
 
                 rate_limit_store[image_key].append(now)
-                image_data = generate_image(improved_prompt)
+                image_data = generate_image(
+                    improved_prompt,
+                    pollinations_model
+                )
 
                 if not image_data:
                     return jsonify({
@@ -1014,7 +1505,7 @@ def generate():
                     try:
                         ts = datetime.datetime.utcnow().isoformat()
 
-                        with db() as cur:
+                        with chat_db() as cur:
                             cur.execute(
                                 """
                                 INSERT INTO generations (email, input, output, ts)
@@ -1045,7 +1536,7 @@ def generate():
                     try:
                         ts = datetime.datetime.utcnow().isoformat()
 
-                        with db() as cur:
+                        with chat_db() as cur:
                             cur.execute(
                                 """
                                 INSERT INTO generations (email, input, output, ts)
@@ -1101,7 +1592,7 @@ def auth_register():
 
     ts = datetime.datetime.utcnow().isoformat()
     try:
-        with db() as cur:
+        with auth_db() as cur:
             cur.execute("SELECT email FROM users WHERE email = %s", (email,))
             existing = cur.fetchone()
             if existing:
@@ -1126,7 +1617,7 @@ def auth_register():
         f"Name: {name}\nEmail: {email}\nTime: {ts}"
     )
     token = _issue_token(email)
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("SELECT * FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
 
@@ -1164,7 +1655,7 @@ def auth_login():
 
     rate_limit_store[login_limit_key].append(now)
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("SELECT * FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
 
@@ -1178,7 +1669,7 @@ def auth_login():
         # Legacy plain-text — accept and upgrade to hash
         password_ok = (stored == password)
         if password_ok:
-            with db() as cur2:
+            with auth_db() as cur2:
                 cur2.execute("UPDATE users SET password = %s WHERE email = %s",
                              (generate_password_hash(password), email))
 
@@ -1186,7 +1677,7 @@ def auth_login():
         return jsonify({"error": "Invalid email or password."}), 401
 
     ts = datetime.datetime.utcnow().isoformat()
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute(
             "UPDATE users SET last_seen = %s, login_count = login_count + 1 WHERE email = %s",
             (ts, email)
@@ -1247,7 +1738,7 @@ def forgot_password():
         }), 429
 
     rate_limit_store[reset_key].append(now)
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
     if not user:
@@ -1256,7 +1747,7 @@ def forgot_password():
     otp = str(random.randint(100000, 999999))
     expires = (datetime.datetime.utcnow() + datetime.timedelta(minutes=10)).isoformat()
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("DELETE FROM password_reset WHERE email = %s", (email,))
         cur.execute(
             "INSERT INTO password_reset (email, otp, expires_at) VALUES (%s, %s, %s)",
@@ -1303,7 +1794,7 @@ def send_reset_link():
 
     rate_limit_store[reset_key].append(now)
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
 
@@ -1314,7 +1805,7 @@ def send_reset_link():
     otp = str(random.randint(100000, 999999))
     expires = (datetime.datetime.utcnow() + datetime.timedelta(minutes=10)).isoformat()
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("DELETE FROM password_reset WHERE email = %s", (email,))
         cur.execute(
             "INSERT INTO password_reset (email, otp, expires_at) VALUES (%s, %s, %s)",
@@ -1344,7 +1835,7 @@ def reset_password():
             "error": f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
         }), 400
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute(
             "SELECT * FROM password_reset WHERE email = %s AND otp = %s",
             (email, otp)
@@ -1357,7 +1848,7 @@ def reset_password():
     if datetime.datetime.utcnow().isoformat() > record[2]:
         return jsonify({"error": "OTP expired"}), 400
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute(
             "UPDATE users SET password = %s WHERE email = %s",
             (generate_password_hash(new_password), email)
@@ -1374,7 +1865,7 @@ def user_consent():
         return err
     body    = request.get_json(silent=True) or {}
     consent = 1 if body.get("consent") else 0
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("UPDATE users SET consent = %s WHERE email = %s", (consent, email))
     logger.info(f"CONSENT | {email} | {'YES' if consent else 'NO'}")
     return jsonify({"status": "ok"})
@@ -1397,7 +1888,7 @@ def user_search():
         }), 413
 
     ts = datetime.datetime.utcnow().isoformat()
-    with db() as cur:
+    with chat_db() as cur:
         cur.execute("INSERT INTO searches (email, query, ts) VALUES (%s, %s, %s)", (email, query, ts))
     return jsonify({"status": "ok"})
 
@@ -1430,7 +1921,7 @@ def user_feedback():
 
     ts = datetime.datetime.utcnow().isoformat()
 
-    with db() as cur:
+    with chat_db() as cur:
         cur.execute(
             "INSERT INTO feedback (email, message, rating, ts) VALUES (%s, %s, %s, %s)",
             (email, message, rating, ts)
@@ -1451,7 +1942,7 @@ def user_history():
     if err:
         return err
 
-    with db() as cur:
+    with chat_db() as cur:
         cur.execute(
             "SELECT input, output, ts FROM generations WHERE email = %s ORDER BY id DESC LIMIT 10",
             (email,)
@@ -1478,13 +1969,13 @@ def training_pair():
             "code": "TRAINING_TOO_LARGE"
         }), 413
 
-    with db() as cur:
+    with auth_db() as cur:
         cur.execute("SELECT consent FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
     if not user or not user[0]:
         return jsonify({"status": "no_consent"})
     ts = datetime.datetime.utcnow().isoformat()
-    with db() as cur:
+    with chat_db() as cur:
         cur.execute(
             "INSERT INTO training_pairs (email, input, output, ts) VALUES (%s, %s, %s, %s)",
             (email, inp, out, ts)
@@ -1523,7 +2014,7 @@ def google_callback():
         ts = datetime.datetime.utcnow().isoformat()
 
         try:
-            with db() as cur:
+            with auth_db() as cur:
                 cur.execute("SELECT * FROM users WHERE email = %s", (email,))
                 user = cur.fetchone()
 
@@ -1604,7 +2095,7 @@ def secure_headers(response):
 if __name__ == "__main__":
     logger.info("Prometix backend starting")
     logger.info(f"AI backend initialized with {len(_GROQ_MODELS)} Groq models")
-    logger.info("Database: Supabase PostgreSQL")
+    logger.info("Database: Supabase Auth + Neon AI Storage")
     logger.info("Security systems initialized")
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Running on 0.0.0.0:{port}")
