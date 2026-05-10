@@ -41,12 +41,7 @@ from authlib.integrations.flask_client import OAuth
 import requests
 import json
 import psycopg2
-try:
-    import google.genai as genai
-    GEMINI_NEW_SDK = True
-except ImportError:
-    import google.generativeai as genai
-    GEMINI_NEW_SDK = False
+from google import genai
 import re
 from functools import wraps
 
