@@ -290,12 +290,12 @@ MODEL_FAILURE_COOLDOWN = 60 * 5  # 5 minutes
 
 RATE_LIMITS = {
     "guest": {
-        "window": 60 * 60,
-        "limit": 2
+        "window": 60 * 60,  # 1 hour
+        "limit": 5          # 5 requests per hour for guests
     },
     "auth": {
-        "window": 60,
-        "limit": 40
+        "window": 60 * 60 * 5,  # 5 hours
+        "limit": 15             # 15 requests per 5 hours for logged-in users
     },
     "image": {
         "window": 60 * 10,
@@ -913,94 +913,93 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
 # ── Pollinations Text Function ──────────────────────────────
 def call_pollinations_text(prompt: str, provider: str = "gpt"):
     """
-    Multi-model Pollinations text routing.
+    Multi-model Pollinations text routing with fallback chain.
+    Uses correct model identifiers per Pollinations API v2.
     """
 
+    # Correct model names per Pollinations API
     provider_map = {
-        "claude": "claude",
-        "gpt": "openai",
-        "gemini": "gemini",
+        "claude":   "claude",
+        "gpt":      "openai",
+        "gemini":   "gemini",
         "deepseek": "deepseek",
-        "qwen": "qwen-coder",
-        "grok": "grok"
+        "qwen":     "qwen",
+        "grok":     "grok",
+        "mistral":  "mistral",
     }
 
-    selected_model = provider_map.get(provider, "openai")
+    # Fallback chain: if selected model fails, try these in order
+    fallback_chain = [
+        provider_map.get(provider, "openai"),
+        "openai",
+        "mistral",
+    ]
+    # Remove duplicates while preserving order
+    seen = set()
+    fallback_chain = [x for x in fallback_chain if not (x in seen or seen.add(x))]
 
-    headers = {
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Content-Type": "application/json"}
     if POLLINATIONS_API_KEY:
         headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
 
-    payload = {
-        "model": selected_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
+    last_error = None
+    for selected_model in fallback_chain:
+        payload = {
+            "model": selected_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "private": True,
+            "seed": -1
+        }
+
+        try:
+            response = requests.post(
+                "https://text.pollinations.ai/openai",
+                headers=headers,
+                json=payload,
+                timeout=50
+            )
+
+            if response.status_code != 200:
+                logger.warning(
+                    f"Pollinations text failed | model={selected_model} | status={response.status_code} | body={response.text[:200]}"
+                )
+                last_error = f"HTTP {response.status_code}"
+                continue
+
+            result = response.json()
+            text = (
+                result.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+
+            if not text:
+                logger.warning(f"Pollinations empty response | model={selected_model}")
+                last_error = "empty response"
+                continue
+
+            # Success
+            return {
+                "text": text,
+                "provider": provider,
+                "model": selected_model,
+                "success": True
             }
-        ]
+
+        except Exception as e:
+            logger.warning(f"Pollinations exception | model={selected_model} | error={e}")
+            last_error = str(e)
+            continue
+
+    # All models in chain failed
+    logger.error(f"All Pollinations models failed | provider={provider} | last_error={last_error}")
+    return {
+        "text": "AI response temporarily unavailable. Please try Gemini mode instead.",
+        "provider": provider,
+        "model": fallback_chain[0],
+        "success": False
     }
-
-    try:
-        response = requests.post(
-            "https://text.pollinations.ai/openai",
-            headers=headers,
-            json=payload,
-            timeout=45
-        )
-
-        if response.status_code != 200:
-            logger.warning(
-                f"Pollinations text failed | model={selected_model} | status={response.status_code}"
-            )
-
-            return {
-                "text": "AI response temporarily unavailable.",
-                "provider": provider,
-                "model": selected_model,
-                "success": False
-            }
-
-        result = response.json()
-
-        text = (
-            result.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-        )
-
-        if not text:
-            logger.warning(
-                f"Pollinations empty response | model={selected_model}"
-            )
-
-            return {
-                "text": "AI response temporarily unavailable.",
-                "provider": provider,
-                "model": selected_model,
-                "success": False
-            }
-
-        return {
-            "text": text,
-            "provider": provider,
-            "model": selected_model,
-            "success": True
-        }
-
-    except Exception:
-        logger.exception("Pollinations text generation failed")
-
-        return {
-            "text": "AI response temporarily unavailable.",
-            "provider": provider,
-            "model": selected_model,
-            "success": False
-        }
 
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
