@@ -1224,14 +1224,16 @@ def generate():
         }), 413
 
     # Gemini Pro limit: 5 requests per 5 hours per user
-    if model_choice == "2.5-pro":
+    # Only applies when mode is "gemini" AND model is "2.5-pro"
+    if mode == "gemini" and model_choice == "2.5-pro":
         window_seconds = 5 * 60 * 60
         now_ts = int(time())
 
         if email:
             with chat_db() as cur:
                 cur.execute(
-                    "SELECT ts FROM generations WHERE email = %s ORDER BY ts DESC LIMIT 20",
+                    """SELECT ts FROM generations WHERE email = %s
+                       ORDER BY ts DESC LIMIT 20""",
                     (email,)
                 )
                 rows = cur.fetchall()
@@ -1249,7 +1251,7 @@ def generate():
 
         if len(recent) >= 5:
             return jsonify({
-                "error": "Pro limit reached (5 requests in 5 hours). Switch to Fast mode.",
+                "error": "Gemini Pro limit reached (5 requests in 5 hours). Switch to Fast mode.",
                 "code": "PRO_LIMIT"
             }), 429
 
