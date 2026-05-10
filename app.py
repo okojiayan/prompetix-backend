@@ -83,46 +83,55 @@ def is_audio_request(text: str) -> bool:
     return any(k in t for k in keywords)
 
 # ── Pollinations image generator ─────────────────────────────
-def generate_image(prompt: str, model: str = "gptimage") -> str:
+def generate_image(prompt: str, model: str = "flux") -> str:
     """
-    Generate image using Pollinations API and return base64.
+    Generate image using Pollinations gen.pollinations.ai unified endpoint.
+    Uses OpenAI-compatible /v1/images/generations — returns base64.
+    Authentication: Authorization: Bearer sk_... header (secret API key).
     """
 
-    import urllib.parse
     import base64
+    from io import BytesIO
 
-    encoded = urllib.parse.quote(prompt)
-
-    # ── Pollinations API Key ─────────────────────────
     pollinations_key = os.environ.get("POLLINATIONS_API_KEY")
 
-    headers = {}
-
+    headers = {"Content-Type": "application/json"}
     if pollinations_key:
         headers["Authorization"] = f"Bearer {pollinations_key}"
 
-    # ── Model Routing ────────────────────────────────
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?model={model}&width=1024&height=1024"
-        f"&enhance=true&safe=true&nologo=true"
-    )
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json",
+        "quality": "medium",
+    }
 
     try:
-        response = requests.get(
-            url,
+        response = requests.post(
+            "https://gen.pollinations.ai/v1/images/generations",
             headers=headers,
-            timeout=40
+            json=payload,
+            timeout=90
         )
 
         if response.status_code == 200:
-            from PIL import Image, ImageDraw, ImageFont
-            from io import BytesIO
+            result = response.json()
+            b64 = (
+                result.get("data", [{}])[0].get("b64_json") or
+                result.get("data", [{}])[0].get("url")
+            )
 
-            img = Image.open(BytesIO(response.content)).convert("RGBA")
+            if not b64:
+                logger.warning("Pollinations image: empty b64_json in response")
+                return None
 
-            # ── Logo Watermark (Prometix) ─────────────────────
-            from PIL import ImageEnhance
+            # ── Decode and add watermark ─────────────────────
+            from PIL import Image, ImageEnhance
+
+            img_bytes = base64.b64decode(b64)
+            img = Image.open(BytesIO(img_bytes)).convert("RGBA")
 
             try:
                 logo_path = os.path.join(os.path.dirname(__file__), "watermark.png")
@@ -139,7 +148,6 @@ def generate_image(prompt: str, model: str = "gptimage") -> str:
 
                 margin = 20
                 position = (margin, img.height - logo.height - margin)
-
                 img.paste(logo, position, logo)
 
             except Exception as e:
@@ -147,11 +155,10 @@ def generate_image(prompt: str, model: str = "gptimage") -> str:
 
             buffered = BytesIO()
             img.save(buffered, format="PNG")
-
             return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
         logger.warning(
-            f"Pollinations image request failed | status={response.status_code}"
+            f"Pollinations image failed | status={response.status_code} | body={response.text[:300]}"
         )
 
     except Exception:
@@ -173,14 +180,17 @@ def generate_audio(prompt: str, model: str = "elevenlabs"):
     if POLLINATIONS_API_KEY:
         headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
 
+    # OpenAI-compatible TTS payload for gen.pollinations.ai
     payload = {
         "model": model,
-        "prompt": prompt
+        "input": prompt,    # gen.pollinations.ai uses "input" not "prompt"
+        "voice": "alloy",
+        "response_format": "mp3"
     }
 
     try:
         response = requests.post(
-            "https://audio.pollinations.ai/generate",
+            "https://gen.pollinations.ai/v1/audio/speech",
             headers=headers,
             json=payload,
             timeout=60
@@ -188,21 +198,18 @@ def generate_audio(prompt: str, model: str = "elevenlabs"):
 
         if response.status_code != 200:
             logger.warning(
-                f"Pollinations audio failed | model={model} | status={response.status_code}"
+                f"Pollinations audio failed | model={model} | status={response.status_code} | body={response.text[:200]}"
             )
             return None
 
-        result = response.json()
-
-        audio_url = (
-            result.get("audio")
-            or result.get("url")
-            or result.get("audio_url")
-        )
+        # Audio endpoint returns binary mp3 — save and return a data URL
+        import base64
+        audio_b64 = base64.b64encode(response.content).decode("utf-8")
+        audio_url = f"data:audio/mp3;base64,{audio_b64}"
 
         if not audio_url:
             logger.warning(
-                f"Pollinations audio returned empty URL | model={model}"
+                f"Pollinations audio returned empty response | model={model}"
             )
             return None
 
@@ -864,7 +871,7 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
         }
         try:
             response = requests.post(
-                "https://text.pollinations.ai/openai",
+                "https://gen.pollinations.ai/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=50
@@ -957,7 +964,7 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
 
         try:
             response = requests.post(
-                "https://text.pollinations.ai/openai",
+                "https://gen.pollinations.ai/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=50
