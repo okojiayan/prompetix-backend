@@ -760,17 +760,19 @@ def _call_single_model(model: str, messages: list) -> str:
 
 def call_groq(user_message: str) -> str:
     """
-    Race both models simultaneously. Return the first successful response.
-    If the winner fails or returns empty, fall back to the other model's result.
-    If both fail, raise the last error.
-    """
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY missing — using Gemini-only pipeline")
-        return user_message
+    Step 1 of the Prometix pipeline:
+    Engineers the user's rough idea into a structured, high-quality prompt.
 
-    intent       = detect_intent(user_message)
-    style        = get_prompt_style(intent, user_message)
-    length       = len(user_message.split())
+    Flow:
+      1. Try Groq (primary — fast, free, high quality)
+      2. If Groq fails → silently fall back to Pollinations (gpt-5.5)
+      3. If Pollinations also fails → return raw message (never crash)
+
+    This function NEVER raises an exception so the pipeline always continues.
+    """
+    intent  = detect_intent(user_message)
+    style   = get_prompt_style(intent, user_message)
+    length  = len(user_message.split())
     context = retrieve_context(user_message)
 
     user_content = (
@@ -784,25 +786,43 @@ def call_groq(user_message: str) -> str:
         {"role": "user",   "content": user_content},
     ]
 
-    last_error = None
-    with ThreadPoolExecutor(max_workers=len(_GROQ_MODELS)) as executor:
-        futures = {
-            executor.submit(_call_single_model, model, messages): model
-            for model in _GROQ_MODELS
-        }
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                # Cancel remaining futures (best-effort)
-                for f in futures:
-                    if f is not future:
-                        f.cancel()
-                return result
-            except Exception as e:
-                last_error = e
-                continue  # Try next model to finish
+    # ── Try Groq first (primary prompt engineer) ──────────────
+    if GROQ_API_KEY:
+        last_error = None
+        with ThreadPoolExecutor(max_workers=len(_GROQ_MODELS)) as executor:
+            futures = {
+                executor.submit(_call_single_model, model, messages): model
+                for model in _GROQ_MODELS
+            }
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    for f in futures:
+                        if f is not future:
+                            f.cancel()
+                    logger.info("Groq prompt engineering succeeded")
+                    return result
+                except Exception as e:
+                    last_error = e
+                    continue
 
-    raise Exception(f"All models failed. Last error: {last_error}")
+        logger.warning(
+            f"Groq prompt engineering failed ({last_error}) — falling back to Pollinations"
+        )
+    else:
+        logger.warning("GROQ_API_KEY not set — falling back to Pollinations for prompt engineering")
+
+    # ── Pollinations fallback (prompt engineering step) ───────
+    # Send the full system prompt + user content to Pollinations
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_content}"
+    poll_result = call_pollinations_text(full_prompt, provider="gpt")
+    if poll_result.get("success") and poll_result.get("text"):
+        logger.info("Pollinations fallback prompt engineering succeeded")
+        return poll_result["text"]
+
+    # ── Last resort: return raw message, never crash ───────────
+    logger.error("All prompt engineering failed — returning raw user message unmodified")
+    return user_message
 
 
 # ── Gemini via Pollinations ──────────────────────────────────
@@ -968,7 +988,7 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     # All models in chain failed
     logger.error(f"All Pollinations models failed | provider={provider} | last_error={last_error}")
     return {
-        "text": "AI response temporarily unavailable. Please try Gemini mode instead.",
+        "text": "AI response temporarily unavailable. Please try again in a moment.",
         "provider": provider,
         "model": fallback_chain[0],
         "success": False
