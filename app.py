@@ -831,9 +831,21 @@ def call_groq(user_message: str) -> str:
 def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
     """
     Routes all Gemini-mode requests through Pollinations.
-    Primary: gemini-fast. Fallback chain: gpt-5.5 → mistral.
+    Model IDs verified from Pollinations dashboard (May 2026).
+    Primary: gemini (Gemini 3 Flash). Fallback: gemini-fast → gpt-5.5 → mistral.
     """
-    gemini_chain = ["gemini-fast", "gpt-5.5", "mistral"]
+    # Map frontend model_choice to correct Pollinations model ID
+    gemini_model_map = {
+        "2.5-pro":   "gemini-large",   # Gemini 3.1 Pro
+        "2.5-flash": "gemini",          # Gemini 3 Flash
+        "1.5-pro":   "gemini-large",
+        "1.5-flash": "gemini-fast",     # Gemini 2.5 Flash Lite
+    }
+    primary = gemini_model_map.get(model_choice, "gemini")
+    gemini_chain = [primary, "gemini-fast", "gpt-5.5", "mistral"]
+    # Remove duplicates preserving order
+    seen_g = set()
+    gemini_chain = [m for m in gemini_chain if not (m in seen_g or seen_g.add(m))]
 
     headers = {"Content-Type": "application/json"}
     if POLLINATIONS_API_KEY:
@@ -908,23 +920,22 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     Uses correct model identifiers per Pollinations API v2.
     """
 
-    # Correct model names per Pollinations API
-    # Exact model IDs from Pollinations dashboard (May 2026)
+    # Correct model IDs verified from Pollinations dashboard (May 2026)
     provider_map = {
-        "claude":   "claude",        # Claude Sonnet 4.6
-        "gpt":      "gpt-5.5",       # GPT-5.5
-        "gemini":   "gemini-fast",   # Gemini 2.5 Flash Lite
-        "deepseek": "deepseek",      # DeepSeek V4 Flash
+        "claude":   "claude",         # Claude Sonnet 4.6
+        "gpt":      "gpt-5.5",        # GPT-5.5
+        "gemini":   "gemini",         # Gemini 3 Flash  (was "gemini-fast" — wrong)
+        "deepseek": "deepseek",       # DeepSeek V4 Flash (Lite)
         "qwen":     "qwen-coder-large", # Qwen3 Coder Next
-        "grok":     "grok-large",    # Grok 4.20 Reasoning
-        "mistral":  "mistral",       # Mistral Small 3.1
+        "grok":     "grok-large",     # Grok 4.20 Reasoning
+        "mistral":  "mistral-large",  # Mistral Large 3  (was "mistral" — Small 3.1)
     }
 
     # Fallback chain: if selected model fails, try these in order
     fallback_chain = [
         provider_map.get(provider, "gpt-5.5"),
         "gpt-5.5",
-        "mistral",
+        "mistral-large",
         "claude",
     ]
     # Remove duplicates while preserving order
@@ -1290,11 +1301,13 @@ def generate():
             # ── Audio Mode ─────────────────────────────
             if audio_mode:
 
-                # Correct audio model IDs from Pollinations dashboard
+                # Correct audio model IDs verified from Pollinations dashboard (May 2026)
                 audio_model_map = {
-                    "elevenlabs-v3": "elevenlabs",   # ElevenLabs v3 TTS
-                    "elevenlabs-v2": "scribe",        # ElevenLabs Scribe v2
-                    "elevenlabs-music": "elevenmusic" # ElevenLabs Music
+                    "elevenlabs-v3":    "elevenlabs",    # ElevenLabs v3 TTS
+                    "elevenlabs-v2":    "scribe",         # ElevenLabs Scribe v2
+                    "elevenlabs-music": "elevenmusic",    # ElevenLabs Music
+                    "qwen-tts":         "qwen-tts",       # Qwen3-TTS Flash
+                    "whisper":          "whisper",        # Whisper Large V3
                 }
                 mapped_audio = audio_model_map.get(pollinations_audio_model, "elevenlabs")
                 audio_fallbacks = [
@@ -1383,19 +1396,21 @@ def generate():
 
             # ── Image Mode ─────────────────────────────
             if image_mode:
-                # Correct image model IDs from Pollinations dashboard
+                # Correct image model IDs verified from Pollinations dashboard (May 2026)
                 image_model_map = {
-                    "nanobanana":  "nanobanana",
-                    "gptimage":    "gptimage-large",  # GPT Image 1.5
-                    "novacanvas":  "nova-canvas",
-                    "flux":        "flux"
+                    "nanobanana":  "nanobanana",      # NanoBanana
+                    "gptimage":    "gptimage",         # GPT Image 1 Mini  (was "gptimage-large" — wrong ID)
+                    "novacanvas":  "nova-canvas",      # Nova Canvas
+                    "flux":        "flux",             # Flux Schnell
+                    "seedream":    "seedream",         # Seedream 4.0
+                    "midijourney": "midijourney",      # MIDIjourney
                 }
                 mapped_img = image_model_map.get(pollinations_model, "flux")
                 image_fallbacks = [
                     mapped_img,
                     "flux",
                     "nanobanana",
-                    "gptimage-large",
+                    "gptimage",
                 ]
 
                 image_data = None
@@ -1503,9 +1518,11 @@ def generate():
                 rate_limit_store[image_key].append(now)
                 image_model_map2 = {
                     "nanobanana":  "nanobanana",
-                    "gptimage":    "gptimage-large",
+                    "gptimage":    "gptimage",         # GPT Image 1 Mini — correct ID
                     "novacanvas":  "nova-canvas",
-                    "flux":        "flux"
+                    "flux":        "flux",
+                    "seedream":    "seedream",
+                    "midijourney": "midijourney",
                 }
                 mapped_img2 = image_model_map2.get(pollinations_model, "flux")
                 image_data = generate_image(
