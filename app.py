@@ -930,18 +930,18 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     Confirmed working model IDs as of May 2026.
     """
 
-    # Free models: work on text.pollinations.ai WITHOUT any API key
-    FREE_MODELS = {"openai", "openai-fast", "mistral", "qwen-coder", "llama", "claude-fast"}
+    # Free models: work on text.pollinations.ai WITHOUT API key
+    FREE_MODELS = {"openai", "openai-fast", "mistral", "qwen-coder", "llama"}
 
-    # Paid models: need Pollen balance on gen.pollinations.ai
+    # Exact model IDs from Pollinations dashboard (paid tier with Pollen)
     provider_map = {
-        "claude":   "claude",      # Claude Sonnet 4.6 — PAID
-        "gpt":      "openai",      # GPT-5.4 Nano — FREE
-        "gemini":   "gemini",      # Gemini 3 Flash — PAID
-        "deepseek": "deepseek",    # DeepSeek V4 Flash — PAID
-        "qwen":     "qwen-coder",  # Qwen3 Coder 30B — FREE
-        "grok":     "grok",        # Grok 4.20 — PAID
-        "mistral":  "mistral",     # Mistral Small 3.2 — FREE
+        "claude":   "claude",        # Claude Sonnet 4.6 — PAID (0.003/req)
+        "gpt":      "openai",        # GPT-5.4 Nano — FREE
+        "gemini":   "gemini-fast",   # Gemini 2.5 Flash Lite — PAID
+        "deepseek": "deepseek",      # DeepSeek V4 Flash — PAID (0.001/req)
+        "qwen":     "qwen-coder",    # Qwen3 Coder 30B — FREE
+        "grok":     "grok-large",    # Grok 4.20 Reasoning — PAID
+        "mistral":  "mistral",       # Mistral Small 3.1 — FREE
     }
 
     selected = provider_map.get(provider, "openai")
@@ -1422,8 +1422,8 @@ def generate():
             if image_mode:
                 # Correct image model IDs verified from Pollinations dashboard (May 2026)
                 image_model_map = {
-                    "nanobanana":  "nanobanana",      # NanoBanana
-                    "gptimage":    "gptimage",         # GPT Image 1 Mini  (was "gptimage-large" — wrong ID)
+                    "nanobanana":   "nanobanana-2",    # NanoBanana 2 — PAID
+                    "gptimage":     "gptimage-large",  # GPT Image 1.5 — PAID
                     "novacanvas":  "nova-canvas",      # Nova Canvas
                     "flux":        "flux",             # Flux Schnell
                     "seedream":    "seedream",         # Seedream 4.0
@@ -1432,9 +1432,7 @@ def generate():
                 mapped_img = image_model_map.get(pollinations_model, "flux")
                 image_fallbacks = [
                     mapped_img,
-                    "flux",
-                    "nanobanana",
-                    "gptimage",
+                    "flux",       # Flux Schnell — always free fallback
                 ]
 
                 image_data = None
@@ -1549,8 +1547,8 @@ def generate():
 
                 rate_limit_store[image_key].append(now)
                 image_model_map2 = {
-                    "nanobanana":  "nanobanana",
-                    "gptimage":    "gptimage",         # GPT Image 1 Mini — correct ID
+                    "nanobanana":  "nanobanana-2",     # NanoBanana 2 — PAID
+                    "gptimage":    "gptimage-large",   # GPT Image 1.5 — PAID
                     "novacanvas":  "nova-canvas",
                     "flux":        "flux",
                     "seedream":    "seedream",
