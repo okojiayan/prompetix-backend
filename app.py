@@ -41,7 +41,12 @@ from authlib.integrations.flask_client import OAuth
 import requests
 import json
 import psycopg2
-import google.generativeai as genai
+try:
+    import google.genai as genai
+    GEMINI_NEW_SDK = True
+except ImportError:
+    import google.generativeai as genai
+    GEMINI_NEW_SDK = False
 import re
 from functools import wraps
 
@@ -160,7 +165,7 @@ def generate_image(prompt: str, model: str = "gptimage") -> str:
     return None
 
 # ── Pollinations audio generator ───────────────────────────
-def generate_audio(prompt: str, model: str = "elevenlabs-v3"):
+def generate_audio(prompt: str, model: str = "elevenlabs"):
     """
     Generate audio/music using Pollinations audio models.
     Returns audio URL if successful.
@@ -918,21 +923,23 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     """
 
     # Correct model names per Pollinations API
+    # Exact model IDs from Pollinations dashboard (May 2026)
     provider_map = {
-        "claude":   "claude",
-        "gpt":      "openai",
-        "gemini":   "gemini",
-        "deepseek": "deepseek",
-        "qwen":     "qwen",
-        "grok":     "grok",
-        "mistral":  "mistral",
+        "claude":   "claude",        # Claude Sonnet 4.6
+        "gpt":      "gpt-5.5",       # GPT-5.5
+        "gemini":   "gemini-fast",   # Gemini 2.5 Flash Lite
+        "deepseek": "deepseek",      # DeepSeek V4 Flash
+        "qwen":     "qwen-coder-large", # Qwen3 Coder Next
+        "grok":     "grok-large",    # Grok 4.20 Reasoning
+        "mistral":  "mistral",       # Mistral Small 3.1
     }
 
     # Fallback chain: if selected model fails, try these in order
     fallback_chain = [
-        provider_map.get(provider, "openai"),
-        "openai",
+        provider_map.get(provider, "gpt-5.5"),
+        "gpt-5.5",
         "mistral",
+        "claude",
     ]
     # Remove duplicates while preserving order
     seen = set()
@@ -1295,11 +1302,17 @@ def generate():
             # ── Audio Mode ─────────────────────────────
             if audio_mode:
 
+                # Correct audio model IDs from Pollinations dashboard
+                audio_model_map = {
+                    "elevenlabs-v3": "elevenlabs",   # ElevenLabs v3 TTS
+                    "elevenlabs-v2": "scribe",        # ElevenLabs Scribe v2
+                    "elevenlabs-music": "elevenmusic" # ElevenLabs Music
+                }
+                mapped_audio = audio_model_map.get(pollinations_audio_model, "elevenlabs")
                 audio_fallbacks = [
-                    pollinations_audio_model,
-                    "elevenlabs-v3",
-                    "elevenlabs-v2",
-                    "elevenlabs-music"
+                    mapped_audio,
+                    "elevenlabs",
+                    "scribe",
                 ]
 
                 audio_url = None
@@ -1382,12 +1395,19 @@ def generate():
 
             # ── Image Mode ─────────────────────────────
             if image_mode:
+                # Correct image model IDs from Pollinations dashboard
+                image_model_map = {
+                    "nanobanana":  "nanobanana",
+                    "gptimage":    "gptimage-large",  # GPT Image 1.5
+                    "novacanvas":  "nova-canvas",
+                    "flux":        "flux"
+                }
+                mapped_img = image_model_map.get(pollinations_model, "flux")
                 image_fallbacks = [
-                    pollinations_model,
+                    mapped_img,
+                    "flux",
                     "nanobanana",
-                    "gptimage",
-                    "novacanvas",
-                    "flux"
+                    "gptimage-large",
                 ]
 
                 image_data = None
@@ -1493,9 +1513,16 @@ def generate():
                     }), 429
 
                 rate_limit_store[image_key].append(now)
+                image_model_map2 = {
+                    "nanobanana":  "nanobanana",
+                    "gptimage":    "gptimage-large",
+                    "novacanvas":  "nova-canvas",
+                    "flux":        "flux"
+                }
+                mapped_img2 = image_model_map2.get(pollinations_model, "flux")
                 image_data = generate_image(
                     improved_prompt,
-                    pollinations_model
+                    mapped_img2
                 )
 
                 if not image_data:
