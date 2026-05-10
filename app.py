@@ -822,7 +822,7 @@ def call_groq(user_message: str) -> str:
     # ── Pollinations fallback (prompt engineering step) ───────
     # Send the full system prompt + user content to Pollinations
     full_prompt = f"{SYSTEM_PROMPT}\n\n{user_content}"
-    poll_result = call_pollinations_text(full_prompt, provider="gpt")
+    poll_result = call_pollinations_text(full_prompt, provider="openai")
     if poll_result.get("success") and poll_result.get("text"):
         logger.info("Pollinations fallback prompt engineering succeeded")
         return poll_result["text"]
@@ -849,7 +849,7 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
         "1.5-flash": "gemini-fast",     # Gemini 2.5 Flash Lite
     }
     primary = gemini_model_map.get(model_choice, "gemini")
-    gemini_chain = [primary, "gemini-fast", "gpt-5.5", "mistral"]
+    gemini_chain = [primary, "gemini-fast", "openai", "mistral"]  # openai = GPT-5.4 Nano
     # Remove duplicates preserving order
     seen_g = set()
     gemini_chain = [m for m in gemini_chain if not (m in seen_g or seen_g.add(m))]
@@ -927,22 +927,24 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     Uses correct model identifiers per Pollinations API v2.
     """
 
-    # Correct model IDs verified from Pollinations dashboard (May 2026)
+    # Correct model IDs from Pollinations gen.pollinations.ai (May 2026)
+    # Note: deepseek, deepseek-pro, gemini, grok-large are PAID (cost Pollen)
+    #       openai, openai-large, mistral, claude are FREE/low-cost
     provider_map = {
-        "claude":   "claude",         # Claude Sonnet 4.6
-        "gpt":      "gpt-5.5",        # GPT-5.5
-        "gemini":   "gemini",         # Gemini 3 Flash  (was "gemini-fast" — wrong)
-        "deepseek": "deepseek",       # DeepSeek V4 Flash (Lite)
-        "qwen":     "qwen-coder-large", # Qwen3 Coder Next
-        "grok":     "grok-large",     # Grok 4.20 Reasoning
-        "mistral":  "mistral-large",  # Mistral Large 3  (was "mistral" — Small 3.1)
+        "claude":   "claude",         # Claude Sonnet 4.6 — free tier
+        "gpt":      "openai",         # GPT-5.4 Nano — free tier (was "gpt-5.5" — wrong)
+        "gemini":   "gemini",         # Gemini 3 Flash — paid
+        "deepseek": "deepseek",       # DeepSeek V4 Flash Lite — paid
+        "qwen":     "qwen-coder",     # Qwen3 Coder 30B (was "qwen-coder-large" — wrong)
+        "grok":     "grok",           # Grok 4.20 Non-Reasoning (was "grok-large" — wrong)
+        "mistral":  "mistral",        # Mistral Small 3.2 — free tier
     }
 
-    # Fallback chain: if selected model fails, try these in order
+    # Fallback chain: try free-tier models so we always get a response
     fallback_chain = [
-        provider_map.get(provider, "gpt-5.5"),
-        "gpt-5.5",
-        "mistral-large",
+        provider_map.get(provider, "openai"),
+        "openai",
+        "mistral",
         "claude",
     ]
     # Remove duplicates while preserving order
@@ -1462,6 +1464,14 @@ def generate():
                 improved_prompt,
                 pollinations_provider
             )
+
+            # If all models failed, return proper error (not fake 200)
+            if not ai_result.get("success"):
+                return jsonify({
+                    "error": "AI model temporarily unavailable. Please try a different model or try again shortly.",
+                    "code": "AI_UNAVAILABLE",
+                    "attempted_provider": pollinations_provider
+                }), 503
 
             if email:
                 try:
