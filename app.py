@@ -41,7 +41,7 @@ from authlib.integrations.flask_client import OAuth
 import requests
 import json
 import psycopg2
-from google import genai
+# google genai removed — Gemini routed through Pollinations
 import re
 from functools import wraps
 
@@ -278,15 +278,11 @@ def is_vpn_or_proxy():
 
     return False
 
- # ── In-memory rate limiting ─────────────────────────────
+# ── In-memory rate limiting ─────────────────────────────
 
 rate_limit_store = defaultdict(list)
 last_rate_cleanup = 0
 RATE_LIMIT_CLEANUP_INTERVAL = 60 * 30  # every 30 minutes
-
-# ── Gemini Model Health Tracking ─────────────────────────────
-model_health = {}
-MODEL_FAILURE_COOLDOWN = 60 * 5  # 5 minutes
 
 RATE_LIMITS = {
     "guest": {
@@ -404,7 +400,7 @@ google = oauth.register(
 # ── Config ────────────────────────────────────────────────────
 # ── Config ────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+# DeepSeek routed through Pollinations — no separate key needed
 POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
 # Internal AI routing models
 _GROQ_MODELS    = [
@@ -431,7 +427,6 @@ REQUIRED_ENV_VARS = {
     "SUPABASE_DATABASE_URL": SUPABASE_DATABASE_URL,
     "NEON_DATABASE_URL": NEON_DATABASE_URL,
     "SECRET_KEY": os.environ.get("SECRET_KEY"),
-    "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY"),
     "EMAIL_PASSWORD": EMAIL_PASSWORD,
     "GOOGLE_CLIENT_ID": os.environ.get("GOOGLE_CLIENT_ID"),
     "GOOGLE_CLIENT_SECRET": os.environ.get("GOOGLE_CLIENT_SECRET")
@@ -448,8 +443,7 @@ if missing_env:
     raise RuntimeError(
         f"Missing required environment variables: {missing_text}"
     )
-# ── Gemini Setup ─────────────────────────────────────────────
-genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# Gemini is now fully routed through Pollinations (gemini-fast model)
 
 def send_email(to_email, subject, message):
     def _send():
@@ -811,100 +805,77 @@ def call_groq(user_message: str) -> str:
     raise Exception(f"All models failed. Last error: {last_error}")
 
 
-# ── Gemini Function ──────────────────────────────────────────
-# ── Gemini Function ──────────────────────────────────────────
+# ── Gemini via Pollinations ──────────────────────────────────
+# Real Gemini API replaced by Pollinations (gemini-fast = Gemini 2.5 Flash Lite).
+# model_choice kept for frontend compatibility; all tiers route through Pollinations.
 def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
-    # ── Dynamic Fallback Chains ─────────────────────────
-    fallback_chains = {
-        "2.5-pro": [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-1.5-pro",
-            "gemini-1.5-flash"
-        ],
+    """
+    Routes all Gemini-mode requests through Pollinations.
+    Primary: gemini-fast. Fallback chain: gpt-5.5 → mistral.
+    """
+    gemini_chain = ["gemini-fast", "gpt-5.5", "mistral"]
 
-        "2.5-flash": [
-            "gemini-2.5-flash",
-            "gemini-1.5-flash"
-        ],
+    headers = {"Content-Type": "application/json"}
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
 
-        "1.5-pro": [
-            "gemini-1.5-pro",
-            "gemini-1.5-flash"
-        ],
-
-        "1.5-flash": [
-            "gemini-1.5-flash"
-        ]
-    }
-
-    model_chain = fallback_chains.get(
-        model_choice,
-        ["gemini-1.5-flash"]
-    )
-
-    # ── Smart health-based routing ─────────────────────
-    now_ts = time()
-
-    filtered_chain = []
-
-    for model in model_chain:
-        failed_until = model_health.get(model, 0)
-
-        if now_ts >= failed_until:
-            filtered_chain.append(model)
-
-    # fallback if all models temporarily unhealthy
-    if not filtered_chain:
-        filtered_chain = model_chain
-
-    model_chain = filtered_chain
-
-    used_fallback = False
     attempted_models = []
+    last_error = None
 
-    for idx, model_name in enumerate(model_chain):
+    for idx, model_name in enumerate(gemini_chain):
+        attempted_models.append(model_name)
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "private": True,
+            "seed": -1
+        }
         try:
-            attempted_models.append(model_name)
+            response = requests.post(
+                "https://text.pollinations.ai/openai",
+                headers=headers,
+                json=payload,
+                timeout=50
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    f"Pollinations gemini-chain failed | model={model_name} | status={response.status_code}"
+                )
+                last_error = f"HTTP {response.status_code}"
+                continue
 
-            # Retry each Gemini model once before fallback
-            for attempt in range(2):
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(prompt)
-                    break
-                except Exception as retry_error:
-                    if attempt == 1:
-                        raise retry_error
+            result = response.json()
+            text = (
+                result.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not text:
+                logger.warning(f"Pollinations gemini-chain empty response | model={model_name}")
+                last_error = "empty response"
+                continue
 
-                    logger.warning(
-                        f"Retrying Gemini model ({model_name}) after temporary failure"
-                    )
-
-            if not response:
-                raise Exception("Empty Gemini response")
-            if response and hasattr(response, "text") and response.text:
-                # Mark healthy again after successful response
-                model_health[model_name] = 0
-                return {
-                    "text": response.text.strip(),
-                    "usedFallback": idx > 0,
-                    "fallbackModel": model_name if idx > 0 else None,
-                    "attemptedModels": attempted_models
-                }
+            return {
+                "text": text,
+                "usedFallback": idx > 0,
+                "fallbackModel": model_name if idx > 0 else None,
+                "attemptedModels": attempted_models
+            }
 
         except Exception as e:
-            logger.warning(f"Gemini model failed ({model_name}): {e}")
-
-            # Mark temporarily unhealthy
-            model_health[model_name] = time() + MODEL_FAILURE_COOLDOWN
-
-            used_fallback = True
+            logger.warning(
+                f"Pollinations gemini-chain exception | model={model_name} | error={e}"
+            )
+            last_error = str(e)
             continue
 
+    logger.error(
+        f"All Pollinations gemini-chain models failed | last_error={last_error}"
+    )
     return {
-        "text": "All Gemini models failed.",
-        "usedFallback": used_fallback,
+        "text": "AI response temporarily unavailable. Please try again.",
+        "usedFallback": True,
         "fallbackModel": None,
         "attemptedModels": attempted_models
     }
