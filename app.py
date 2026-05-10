@@ -849,7 +849,8 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
         "1.5-flash": "gemini-fast",     # Gemini 2.5 Flash Lite
     }
     primary = gemini_model_map.get(model_choice, "gemini")
-    gemini_chain = [primary, "gemini-fast", "openai", "mistral"]  # openai = GPT-5.4 Nano
+    gemini_chain = [primary, "gemini-fast", "openai", "mistral"]
+    # gemini-fast and openai/mistral are free on text.pollinations.ai
     # Remove duplicates preserving order
     seen_g = set()
     gemini_chain = [m for m in gemini_chain if not (m in seen_g or seen_g.add(m))]
@@ -871,7 +872,7 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
         }
         try:
             response = requests.post(
-                "https://gen.pollinations.ai/v1/chat/completions",
+                "https://text.pollinations.ai/openai",
                 headers=headers,
                 json=payload,
                 timeout=50
@@ -923,50 +924,65 @@ def call_gemini(prompt: str, model_choice: str = "2.5-flash"):
 # ── Pollinations Text Function ──────────────────────────────
 def call_pollinations_text(prompt: str, provider: str = "gpt"):
     """
-    Multi-model Pollinations text routing with fallback chain.
-    Uses correct model identifiers per Pollinations API v2.
+    Multi-model text routing via Pollinations.
+    - Free models → text.pollinations.ai/openai (no auth required)
+    - Paid models → gen.pollinations.ai/v1/chat/completions (needs API key + Pollen)
+    Confirmed working model IDs as of May 2026.
     """
 
-    # Correct model IDs from Pollinations gen.pollinations.ai (May 2026)
-    # Note: deepseek, deepseek-pro, gemini, grok-large are PAID (cost Pollen)
-    #       openai, openai-large, mistral, claude are FREE/low-cost
+    # Free models: work on text.pollinations.ai WITHOUT any API key
+    FREE_MODELS = {"openai", "openai-fast", "mistral", "qwen-coder", "llama", "claude-fast"}
+
+    # Paid models: need Pollen balance on gen.pollinations.ai
     provider_map = {
-        "claude":   "claude",         # Claude Sonnet 4.6 — free tier
-        "gpt":      "openai",         # GPT-5.4 Nano — free tier (was "gpt-5.5" — wrong)
-        "gemini":   "gemini",         # Gemini 3 Flash — paid
-        "deepseek": "deepseek",       # DeepSeek V4 Flash Lite — paid
-        "qwen":     "qwen-coder",     # Qwen3 Coder 30B (was "qwen-coder-large" — wrong)
-        "grok":     "grok",           # Grok 4.20 Non-Reasoning (was "grok-large" — wrong)
-        "mistral":  "mistral",        # Mistral Small 3.2 — free tier
+        "claude":   "claude",      # Claude Sonnet 4.6 — PAID
+        "gpt":      "openai",      # GPT-5.4 Nano — FREE
+        "gemini":   "gemini",      # Gemini 3 Flash — PAID
+        "deepseek": "deepseek",    # DeepSeek V4 Flash — PAID
+        "qwen":     "qwen-coder",  # Qwen3 Coder 30B — FREE
+        "grok":     "grok",        # Grok 4.20 — PAID
+        "mistral":  "mistral",     # Mistral Small 3.2 — FREE
     }
 
-    # Fallback chain: try free-tier models so we always get a response
-    fallback_chain = [
-        provider_map.get(provider, "openai"),
-        "openai",
-        "mistral",
-        "claude",
-    ]
-    # Remove duplicates while preserving order
-    seen = set()
-    fallback_chain = [x for x in fallback_chain if not (x in seen or seen.add(x))]
+    selected = provider_map.get(provider, "openai")
 
-    headers = {"Content-Type": "application/json"}
-    if POLLINATIONS_API_KEY:
-        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+    # Always fallback to free models to guarantee a response
+    fallback_chain = [selected]
+    for m in ["openai", "mistral", "qwen-coder"]:
+        if m not in fallback_chain:
+            fallback_chain.append(m)
 
+    pollinations_key = os.environ.get("POLLINATIONS_API_KEY")
     last_error = None
-    for selected_model in fallback_chain:
+
+    for model_id in fallback_chain:
+        is_free = model_id in FREE_MODELS
+
+        # Free models: use text.pollinations.ai (no key needed, always works)
+        # Paid models: use gen.pollinations.ai with Bearer token
+        if is_free:
+            endpoint = "https://text.pollinations.ai/openai"
+            headers = {"Content-Type": "application/json"}
+        else:
+            endpoint = "https://gen.pollinations.ai/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if pollinations_key:
+                headers["Authorization"] = f"Bearer {pollinations_key}"
+            else:
+                # No key — skip paid model, go to next fallback
+                logger.warning(f"Skipping paid model {model_id} — no POLLINATIONS_API_KEY")
+                last_error = "no_api_key"
+                continue
+
         payload = {
-            "model": selected_model,
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "private": True,
-            "seed": -1
         }
 
         try:
             response = requests.post(
-                "https://gen.pollinations.ai/v1/chat/completions",
+                endpoint,
                 headers=headers,
                 json=payload,
                 timeout=50
@@ -974,7 +990,8 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Pollinations text failed | model={selected_model} | status={response.status_code} | body={response.text[:200]}"
+                    f"Pollinations text failed | model={model_id} | endpoint={endpoint} "
+                    f"| status={response.status_code} | body={response.text[:200]}"
                 )
                 last_error = f"HTTP {response.status_code}"
                 continue
@@ -988,32 +1005,30 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
             )
 
             if not text:
-                logger.warning(f"Pollinations empty response | model={selected_model}")
+                logger.warning(f"Pollinations empty response | model={model_id}")
                 last_error = "empty response"
                 continue
 
-            # Success
+            logger.info(f"Pollinations text success | model={model_id} | provider={provider}")
             return {
                 "text": text,
                 "provider": provider,
-                "model": selected_model,
+                "model": model_id,
                 "success": True
             }
 
         except Exception as e:
-            logger.warning(f"Pollinations exception | model={selected_model} | error={e}")
+            logger.warning(f"Pollinations exception | model={model_id} | error={e}")
             last_error = str(e)
             continue
 
-    # All models in chain failed
     logger.error(f"All Pollinations models failed | provider={provider} | last_error={last_error}")
     return {
         "text": "AI response temporarily unavailable. Please try again in a moment.",
         "provider": provider,
-        "model": fallback_chain[0],
+        "model": selected,
         "success": False
     }
-
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
