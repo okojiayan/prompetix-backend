@@ -449,7 +449,7 @@ if missing_env:
         f"Missing required environment variables: {missing_text}"
     )
 # ── Gemini Setup ─────────────────────────────────────────────
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 def send_email(to_email, subject, message):
     def _send():
