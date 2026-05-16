@@ -399,8 +399,8 @@ def is_valid_email(email: str) -> bool:
 app = Flask(__name__)
 
 # ── ProxyFix — required on Render (sits behind a reverse proxy) ──
-# Without this, Flask generates http:// URLs internally which breaks
-# OAuth state validation since Google redirects to https://.
+# Without this, Flask sees requests as http:// internally, which breaks
+# OAuth because Google only redirects to https:// URIs.
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
@@ -414,14 +414,13 @@ if not SECRET_KEY:
 
 app.secret_key = SECRET_KEY
 app.config.update(
-    # ── CRITICAL for cross-domain OAuth (frontend on Netlify, backend on Render) ──
-    # SameSite=None + Secure=True allows the browser to send the session cookie
-    # back on the /google-callback redirect, which is cross-origin.
-    # Without this, Flask loses the OAuth state between /auth/google and
-    # /google-callback, causing the "GOOGLE_AUTH_ERROR" / invalid_state error.
+    # SameSite=None is required when frontend (Netlify) and backend (Render)
+    # are on different domains. With SameSite=Lax, the browser drops the
+    # Flask session cookie on the cross-origin /google-callback redirect,
+    # so Flask loses the OAuth state → invalid_state → GOOGLE_AUTH_ERROR.
     SESSION_COOKIE_HTTPONLY  = True,
     SESSION_COOKIE_SECURE    = True,
-    SESSION_COOKIE_SAMESITE  = "None",   # ← was "Lax" — FIXED
+    SESSION_COOKIE_SAMESITE  = "None",    # ← was "Lax", FIXED
     SESSION_COOKIE_NAME      = "prometix_oauth_session",
     PERMANENT_SESSION_LIFETIME = datetime.timedelta(days=7),
 )
@@ -2122,11 +2121,12 @@ def google_login():
 def google_callback():
     logger.info("Google OAuth callback triggered")
     try:
-        # ── Explicitly pass the same redirect_uri used in authorize_redirect ──
-        # Authlib validates that the redirect_uri in the token exchange matches
-        # the one used to start the flow. Omitting it causes silent mismatches.
-        redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
-        token = google.authorize_access_token(redirect_uri=redirect_uri)
+        # authorize_access_token() reads the state/code from the query string
+        # and validates them against what was stored in the Flask session.
+        # Do NOT pass redirect_uri as a kwarg — it causes a TypeError on
+        # older Authlib versions. The redirect_uri is already embedded in
+        # the authorization URL that was built in google_login().
+        token = google.authorize_access_token()
         user_info = google.get("userinfo", token=token).json()
 
         email = user_info.get("email")
@@ -2175,23 +2175,20 @@ def google_callback():
         except Exception as e:
             logger.warning(f"Google login email error: {e}")
 
-        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com").rstrip("/")
-        # URL-encode name to handle spaces/special characters safely
         from urllib.parse import quote
-        safe_name  = quote(name,  safe="")
-        safe_email = quote(email, safe="")
+        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com").rstrip("/")
+        safe_name    = quote(name,  safe="")
+        safe_email   = quote(email, safe="")
         return redirect(
             f"{frontend_url}/login.html?token={session_token}&name={safe_name}&email={safe_email}"
         )
 
     except Exception as e:
-        # Log the EXACT exception so you can see it in Render logs
         logger.exception(f"Google OAuth callback failure: {type(e).__name__}: {e}")
-        return jsonify({
-            "error": "Google authentication failed.",
-            "code": "GOOGLE_AUTH_ERROR",
-            "detail": type(e).__name__  # visible in response for debugging
-        }), 500
+        return redirect(
+            f"{os.environ.get('FRONTEND_URL', 'https://atimosai.com').rstrip('/')}"
+            f"/login.html?error=google_auth_failed"
+        )
 
 
 # ── Security Headers ─────────────────────────────────────────
