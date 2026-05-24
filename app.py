@@ -358,7 +358,7 @@ RATE_LIMITS = {
 
 
 MAX_PROMPT_LENGTH = 8000
-SESSION_EXPIRY_DAYS = 7
+SESSION_EXPIRY_DAYS = 90  # 90-day rolling window — survives deployments
 
 # ── User data validation limits ─────────────────────────────
 MAX_NAME_LENGTH = 80
@@ -658,12 +658,10 @@ def _validate_token():
             expiry_dt = datetime.datetime.fromisoformat(str(expires_at))
 
             if datetime.datetime.utcnow() > expiry_dt:
-                with auth_db() as cur:
-                    cur.execute(
-                        "DELETE FROM sessions WHERE token = %s",
-                        (token,)
-                    )
-
+                # Don't delete — just reject. A background cleanup job
+                # removes stale sessions. This prevents race conditions
+                # on cold-start where the frontend refresh and the delete
+                # happen at the same time.
                 return None, (
                     jsonify({
                         "error": "Session expired. Please sign in again.",
@@ -1847,6 +1845,77 @@ def auth_logout():
         token = auth_header[len("Bearer "):].strip()
         _invalidate_token(token)
     return jsonify({"status": "ok"})
+
+
+# ── Auth: refresh / keep-alive ────────────────────────────────
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    """
+    Called by the frontend on every page load (silently, in background).
+    - Validates token and extends its expiry by SESSION_EXPIRY_DAYS
+    - Returns fresh user profile so frontend stays up-to-date
+    - On ANY error (DB down, cold-start, network) returns 503 NOT 401
+      so the frontend knows to keep the cached session instead of logging out
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "No token", "code": "TOKEN_MISSING"}), 401
+
+    token = auth_header[len("Bearer "):].strip()
+    if len(token) < 20:
+        return jsonify({"error": "Invalid token", "code": "TOKEN_INVALID"}), 401
+
+    try:
+        email, err = _validate_token()
+    except Exception as e:
+        # DB connection error during cold-start — tell frontend to keep session
+        logger.warning(f"auth/refresh: DB error during token validation: {e}")
+        return jsonify({
+            "error": "Backend temporarily unavailable",
+            "code": "BACKEND_UNAVAILABLE"
+        }), 503
+
+    if err:
+        # Real invalid/expired token
+        return err
+
+    try:
+        with auth_db() as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+    except Exception as e:
+        logger.warning(f"auth/refresh: DB error fetching user: {e}")
+        return jsonify({
+            "error": "Backend temporarily unavailable",
+            "code": "BACKEND_UNAVAILABLE"
+        }), 503
+
+    if not user:
+        return jsonify({"error": "Account not found.", "code": "USER_NOT_FOUND"}), 404
+
+    return jsonify({"status": "ok", "user": _public_profile(user)})
+
+
+# ── Background: clean up expired sessions (runs on startup) ────
+def _cleanup_expired_sessions():
+    """Delete sessions older than SESSION_EXPIRY_DAYS. Runs once on startup."""
+    try:
+        cutoff = (
+            datetime.datetime.utcnow() -
+            datetime.timedelta(days=SESSION_EXPIRY_DAYS + 5)
+        ).isoformat()
+        with auth_db() as cur:
+            cur.execute(
+                "DELETE FROM sessions WHERE expires_at < %s",
+                (cutoff,)
+            )
+        logger.info("Expired session cleanup completed")
+    except Exception as e:
+        logger.warning(f"Session cleanup failed (non-fatal): {e}")
+
+# Run cleanup in background thread so it doesn't block startup
+threading.Thread(target=_cleanup_expired_sessions, daemon=True).start()
+
 
 # ── Auth: forgot password ─────────────────────────────────────
 import random
