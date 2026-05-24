@@ -1297,12 +1297,7 @@ def generate():
 
     if model_choice not in allowed_models:
         model_choice = "2.5-flash"
-    # ── Restrict premium AI features for guests ─────────────────────────
-    if not email and mode in ["gemini", "pollinations"]:
-        return jsonify({
-            "error": "Login required to use AI features.",
-            "code": "LOGIN_REQUIRED"
-        }), 403
+    # Guests can use all AI modes — limited by request count only
     if not user_message:
         return jsonify({"error": "Message cannot be empty."}), 400
 
