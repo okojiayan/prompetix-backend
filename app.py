@@ -398,12 +398,6 @@ def is_valid_email(email: str) -> bool:
 # ── Flask App Initialization and CORS ────────────────────────
 app = Flask(__name__)
 
-# ── ProxyFix — required on Render (sits behind a reverse proxy) ──
-# Without this, Flask sees requests as http:// internally, which breaks
-# OAuth because Google only redirects to https:// URIs.
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
 # ── Request size protection ───────────────────────────
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
 
@@ -414,15 +408,10 @@ if not SECRET_KEY:
 
 app.secret_key = SECRET_KEY
 app.config.update(
-    # SameSite=None is required when frontend (Netlify) and backend (Render)
-    # are on different domains. With SameSite=Lax, the browser drops the
-    # Flask session cookie on the cross-origin /google-callback redirect,
-    # so Flask loses the OAuth state → invalid_state → GOOGLE_AUTH_ERROR.
-    SESSION_COOKIE_HTTPONLY  = True,
-    SESSION_COOKIE_SECURE    = True,
-    SESSION_COOKIE_SAMESITE  = "None",    # ← was "Lax", FIXED
-    SESSION_COOKIE_NAME      = "prometix_oauth_session",
-    PERMANENT_SESSION_LIFETIME = datetime.timedelta(days=7),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7)
 )
 
 frontend_origin = os.environ.get("FRONTEND_URL")
@@ -733,13 +722,13 @@ def _public_profile(row) -> dict:
     }
 
 # ── System prompt ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are Prometix, an expert prompt engineer built by Atimos AI.
+SYSTEM_PROMPT = """You are Prometix, an intelligent multi-AI orchestration platform built by Atimos AI.
 
-YOUR ONLY JOB:
-Rewrite the user's input into a clean, high-quality, structured prompt that another AI can execute perfectly.
+YOUR CORE MISSION:
+Transform the user's rough idea into a clean, high-quality, AI-ready prompt, then route it to the most capable model for that task.
 
 STRICT OUTPUT RULES:
-- Output ONLY the final prompt text.
+- Output ONLY the final engineered prompt text.
 - DO NOT include any introduction, explanation, or commentary.
 - DO NOT write phrases like "Here is your prompt", "Rewritten Prompt", or anything similar.
 - DO NOT include labels, headings, or prefixes.
@@ -751,7 +740,7 @@ PROMPT QUALITY RULES:
 - Preserve the user's intent exactly.
 - Improve clarity, specificity, and usefulness.
 - Add relevant context, constraints, tone, and format instructions.
-- Ensure the prompt is immediately usable in AI tools.
+- Ensure the prompt is immediately usable in any AI tool.
 - Keep it concise (1-4 sentences unless absolutely needed).
 
 The response must be ready to copy-paste directly into any AI tool.
@@ -990,14 +979,17 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
     FREE_MODELS = {"openai", "openai-fast", "mistral", "qwen-coder", "llama"}
 
     # Exact model IDs from Pollinations dashboard (paid tier with Pollen)
+    # Full multi-model AI system — all providers Prometix supports
     provider_map = {
         "claude":   "claude",        # Claude Sonnet 4.6 — PAID (0.003/req)
         "gpt":      "openai",        # GPT-5.4 Nano — FREE
+        "openai":   "openai",        # GPT-5.4 Nano — FREE (alias)
         "gemini":   "gemini-fast",   # Gemini 2.5 Flash Lite — PAID
         "deepseek": "deepseek",      # DeepSeek V4 Flash — PAID (0.001/req)
         "qwen":     "qwen-coder",    # Qwen3 Coder 30B — FREE
         "grok":     "grok-large",    # Grok 4.20 Reasoning — PAID
         "mistral":  "mistral",       # Mistral Small 3.1 — FREE
+        "llama":    "llama",         # Meta Llama — FREE fallback
     }
 
     selected = provider_map.get(provider, "openai")
@@ -1088,7 +1080,12 @@ def call_pollinations_text(prompt: str, provider: str = "gpt"):
 # ── Health ────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "product": "Prometix by Atimos AI"})
+    return jsonify({
+        "status": "ok",
+        "product": "Prometix by Atimos AI",
+        "platform": "Multi-AI Orchestration",
+        "models": ["GPT", "Claude", "Gemini", "Grok", "DeepSeek", "Qwen", "Mistral", "Flux", "ElevenLabs"]
+    })
 
 # ── Root Route (for uptime + browser access) ──────────────────
 @app.route("/", methods=["GET"])
@@ -1261,7 +1258,9 @@ def generate():
         "gemini",
         "deepseek",
         "qwen",
-        "grok"
+        "grok",
+        "mistral",
+        "openai",
     }
 
     if pollinations_provider not in allowed_pollinations_providers:
@@ -1277,12 +1276,8 @@ def generate():
 
     if model_choice not in allowed_models:
         model_choice = "2.5-flash"
-    # ── Restrict premium AI features for guests ─────────────────────────
-    if not email and mode in ["gemini", "pollinations"]:
-        return jsonify({
-            "error": "Login required to use AI features.",
-            "code": "LOGIN_REQUIRED"
-        }), 403
+    # ── Guests allowed up to 5 requests (handled above by rate limiter) ──
+    # No login required for basic AI features
     if not user_message:
         return jsonify({"error": "Message cannot be empty."}), 400
 
@@ -1992,6 +1987,28 @@ def user_consent():
     logger.info(f"CONSENT | {email} | {'YES' if consent else 'NO'}")
     return jsonify({"status": "ok"})
 
+# ── User: AI Credits ──────────────────────────────────────────
+@app.route("/user/credits", methods=["GET"])
+def user_credits():
+    """
+    Returns the user's AI credit balance.
+    Credits are tracked server-side for paid tiers;
+    for free tier the frontend tracks locally.
+    """
+    email, err = _validate_token()
+    if err:
+        return err
+
+    # For now, return a generous free allocation.
+    # Future: track in DB with daily reset logic.
+    FREE_DAILY_CREDITS = 50
+    return jsonify({
+        "balance": FREE_DAILY_CREDITS,
+        "daily_limit": FREE_DAILY_CREDITS,
+        "tier": "free",
+        "resets_at": "midnight UTC"
+    })
+
 # ── User: search log ─────────────────────────────────────────
 @app.route("/user/search", methods=["POST"])
 def user_search():
@@ -2121,19 +2138,13 @@ def google_login():
 def google_callback():
     logger.info("Google OAuth callback triggered")
     try:
-        # authorize_access_token() reads the state/code from the query string
-        # and validates them against what was stored in the Flask session.
-        # Do NOT pass redirect_uri as a kwarg — it causes a TypeError on
-        # older Authlib versions. The redirect_uri is already embedded in
-        # the authorization URL that was built in google_login().
         token = google.authorize_access_token()
         user_info = google.get("userinfo", token=token).json()
 
         email = user_info.get("email")
-        name  = user_info.get("name")
+        name = user_info.get("name")
 
         if not email or not name:
-            logger.error(f"Google OAuth missing user data: email={email}, name={name}")
             return jsonify({
                 "error": "Google authentication failed.",
                 "code": "GOOGLE_USERDATA_MISSING"
@@ -2157,15 +2168,16 @@ def google_callback():
                         "UPDATE users SET last_seen = %s, login_count = login_count + 1 WHERE email = %s",
                         (ts, email)
                     )
-        except Exception:
+        except Exception as e:
             logger.exception("Database error during Google login")
+
             return jsonify({
                 "error": "Account login failed.",
                 "code": "GOOGLE_DB_ERROR"
             }), 500
 
         session_token = _issue_token(email)
-
+        # Send login notification email for Google login
         try:
             send_email(
                 "admin@atimosai.com",
@@ -2175,20 +2187,16 @@ def google_callback():
         except Exception as e:
             logger.warning(f"Google login email error: {e}")
 
-        from urllib.parse import quote
-        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com").rstrip("/")
-        safe_name    = quote(name,  safe="")
-        safe_email   = quote(email, safe="")
-        return redirect(
-            f"{frontend_url}/login.html?token={session_token}&name={safe_name}&email={safe_email}"
-        )
+        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com")
+        return redirect(f"{frontend_url}/login.html?token={session_token}&name={name}&email={email}")
 
     except Exception as e:
-        logger.exception(f"Google OAuth callback failure: {type(e).__name__}: {e}")
-        return redirect(
-            f"{os.environ.get('FRONTEND_URL', 'https://atimosai.com').rstrip('/')}"
-            f"/login.html?error=google_auth_failed"
-        )
+        logger.exception("Google OAuth callback failure")
+
+        return jsonify({
+            "error": "Google authentication failed.",
+            "code": "GOOGLE_AUTH_ERROR"
+        }), 500
 
 
 # ── Security Headers ─────────────────────────────────────────
