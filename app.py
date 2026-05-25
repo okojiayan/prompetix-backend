@@ -228,8 +228,9 @@ def generate_audio(prompt: str, model: str = "elevenlabs"):
         "Content-Type": "application/json"
     }
 
-    if POLLINATIONS_API_KEY:
-        headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+    _pollinations_key = os.environ.get("POLLINATIONS_API_KEY")
+    if _pollinations_key:
+        headers["Authorization"] = f"Bearer {_pollinations_key}"
 
     # OpenAI-compatible TTS payload for gen.pollinations.ai
     payload = {
@@ -369,7 +370,7 @@ def check_token_limit(client_key: str, tier: str, message: str) -> tuple:
     Returns (allowed: bool, tokens_used: int, tokens_remaining: int)
     Resets window if expired.
     """
-    now    = time.time()
+    now    = time()
     config = TOKEN_LIMITS.get(tier, TOKEN_LIMITS["guest"])
     window = config["window"]
     limit  = config["limit"]
@@ -1219,9 +1220,21 @@ def generate():
         resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
         return resp, 403
 
+    # ── Parse JSON body once (stream can only be read once) ──────
+    if request.content_type and "application/json" not in request.content_type:
+        return jsonify({
+            "error": "Unsupported content type.",
+            "code": "INVALID_CONTENT_TYPE"
+        }), 415
+
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({"error": "Invalid JSON in request body."}), 400
+
     # ── Guest token-based usage limits ────────────────────────
     if not email:
-        user_message_preview = (request.get_json(silent=True) or {}).get("message", "")
+        user_message_preview = data.get("message", "")
         allowed, used, remaining = check_token_limit(
             client_key, "guest", user_message_preview
         )
@@ -1237,7 +1250,7 @@ def generate():
 
     # ── Logged-in token-based usage limits ────────────────────
     else:
-        user_message_preview = (request.get_json(silent=True) or {}).get("message", "")
+        user_message_preview = data.get("message", "")
         allowed, used, remaining = check_token_limit(
             f"auth:{client_key}", "auth", user_message_preview
         )
@@ -1250,18 +1263,6 @@ def generate():
             })
             resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
             return resp, 429
-
-    data = request.get_json(silent=True)
-
-    # ── Request type validation ────────────────────────
-    if request.content_type and "application/json" not in request.content_type:
-        return jsonify({
-            "error": "Unsupported content type.",
-            "code": "INVALID_CONTENT_TYPE"
-        }), 415
-
-    if not data:
-        return jsonify({"error": "Invalid JSON in request body."}), 400
 
     user_message = sanitize_text(
         data.get("message") or "",
