@@ -86,45 +86,51 @@ def is_audio_request(text: str) -> bool:
 def detect_image_size(prompt: str) -> str:
     p = prompt.lower()
 
-    # YouTube thumbnails / banners
+    # ── Landscape / Wide (1792x1024) ─────────────────────────
     if any(k in p for k in [
-        "youtube thumbnail",
-        "thumbnail",
-        "youtube banner",
-        "banner",
-        "cover photo"
+        "youtube thumbnail", "thumbnail",
+        "youtube banner", "banner",
+        "cover photo", "cover image",
+        "twitter header", "linkedin banner",
+        "facebook cover", "website banner",
+        "desktop wallpaper", "pc wallpaper",
+        "laptop wallpaper", "monitor wallpaper",
+        "landscape", "wide", "horizontal",
+        "16:9", "widescreen",
+        "presentation slide", "powerpoint",
+        "email header", "newsletter header",
+        "blog header", "article header",
     ]):
         return "1792x1024"
 
-    # Mobile wallpapers
+    # ── Portrait / Tall (1024x1792) ───────────────────────────
     if any(k in p for k in [
-        "phone wallpaper",
-        "mobile wallpaper",
-        "iphone wallpaper",
-        "android wallpaper"
+        "phone wallpaper", "mobile wallpaper",
+        "iphone wallpaper", "android wallpaper",
+        "instagram story", "story",
+        "reel", "shorts", "tiktok",
+        "portrait", "vertical",
+        "9:16", "tall",
+        "pinterest pin", "pin",
+        "kindle cover", "book cover",
+        "poster", "flyer",
+        "id card", "visiting card",
     ]):
         return "1024x1792"
 
-    # Desktop wallpapers
+    # ── Square (1024x1024) — default ──────────────────────────
+    # Instagram post, profile picture, logo, product image
     if any(k in p for k in [
-        "desktop wallpaper",
-        "pc wallpaper",
-        "laptop wallpaper",
-        "wallpaper"
+        "instagram post", "instagram",
+        "profile picture", "profile photo", "avatar",
+        "logo", "icon", "product image",
+        "square", "1:1",
+        "whatsapp dp", "dp",
+        "nft", "album cover",
     ]):
-        return "1792x1024"
+        return "1024x1024"
 
-    # Portrait / reels / stories
-    if any(k in p for k in [
-        "instagram story",
-        "story",
-        "reel",
-        "shorts",
-        "tiktok"
-    ]):
-        return "1024x1792"
-
-    # Default square
+    # Default — square
     return "1024x1024"
 
 # ── Pollinations image generator ─────────────────────────────
@@ -336,10 +342,59 @@ rate_limit_store = defaultdict(list)
 last_rate_cleanup = 0
 RATE_LIMIT_CLEANUP_INTERVAL = 60 * 30  # every 30 minutes
 
+# ── Token-based limits ───────────────────────────────────
+# 1 token ≈ 4 characters (rough estimate, no tokenizer needed)
+# Guest:       2,000 tokens per hour
+# Logged-in:  10,000 tokens per 5 hours
+
+TOKEN_LIMITS = {
+    "guest": {
+        "window": 60 * 60,       # 1 hour
+        "limit": 2000,           # ~400 words per hour
+    },
+    "auth": {
+        "window": 60 * 60 * 5,  # 5 hours
+        "limit": 10000,          # ~2000 words per 5 hours
+    },
+}
+
+token_usage_store = defaultdict(lambda: {"tokens": 0, "window_start": 0})
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: 1 token ≈ 4 chars."""
+    return max(1, len(text) // 4)
+
+def check_token_limit(client_key: str, tier: str, message: str) -> tuple:
+    """
+    Returns (allowed: bool, tokens_used: int, tokens_remaining: int)
+    Resets window if expired.
+    """
+    now    = time.time()
+    config = TOKEN_LIMITS.get(tier, TOKEN_LIMITS["guest"])
+    window = config["window"]
+    limit  = config["limit"]
+    usage  = token_usage_store[client_key]
+
+    # Reset window if expired
+    if now - usage["window_start"] > window:
+        usage["tokens"]       = 0
+        usage["window_start"] = now
+
+    tokens_this_msg = estimate_tokens(message)
+    tokens_used     = usage["tokens"]
+    tokens_remaining = limit - tokens_used
+
+    if tokens_used + tokens_this_msg > limit:
+        return False, tokens_used, max(0, tokens_remaining)
+
+    # Consume tokens
+    usage["tokens"] += tokens_this_msg
+    return True, usage["tokens"], max(0, limit - usage["tokens"])
+
 RATE_LIMITS = {
     "guest": {
         "window": 60 * 60,  # 1 hour
-        "limit": 5          # 5 requests per hour for guests
+        "limit": 5          # 5 requests per hour for guests (kept as fallback)
     },
     "auth": {
         "window": 60 * 60 * 5,  # 5 hours
@@ -1164,56 +1219,37 @@ def generate():
         resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
         return resp, 403
 
-    # ── Guest usage limits ─────────────────────────────
+    # ── Guest token-based usage limits ────────────────────────
     if not email:
-        window = RATE_LIMITS["guest"]["window"]
-        limit = RATE_LIMITS["guest"]["limit"]
-
-        if client_key not in rate_limit_store:
-            rate_limit_store[client_key] = []
-
-        # remove old timestamps
-        rate_limit_store[client_key] = [
-            t for t in rate_limit_store[client_key] if now - t < window
-        ]
-
-        if len(rate_limit_store[client_key]) >= limit:
+        user_message_preview = (request.get_json(silent=True) or {}).get("message", "")
+        allowed, used, remaining = check_token_limit(
+            client_key, "guest", user_message_preview
+        )
+        if not allowed:
             resp = jsonify({
-                "error": "Free preview completed. Login to continue using Prometix AI.",
-                "code": "GUEST_LIMIT"
+                "error": f"You've used your free token quota ({TOKEN_LIMITS['guest']['limit']} tokens/hour). Login to get 5× more tokens.",
+                "code": "GUEST_TOKEN_LIMIT",
+                "tokens_used": used,
+                "tokens_remaining": 0,
             })
             resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
             return resp, 429
 
-        rate_limit_store[client_key].append(now)
-
-    # ── General request rate limiting ─────────────────────
-    auth_limit = RATE_LIMITS["auth"]
-    auth_rate_key = f"auth:{client_key}"
-
-    if auth_rate_key not in rate_limit_store:
-        rate_limit_store[auth_rate_key] = []
-
-    rate_limit_store[auth_rate_key] = [
-        t for t in rate_limit_store[auth_rate_key]
-        if now - t < auth_limit["window"]
-    ]
-
-    if len(rate_limit_store[auth_rate_key]) >= auth_limit["limit"]:
-        resp = jsonify({
-            "error": "Too many requests. Please slow down.",
-            "code": "RATE_LIMITED"
-        })
-        resp.set_cookie(
-            "device_id",
-            device_cookie,
-            max_age=60*60*24*30,
-            httponly=True,
-            samesite="Lax"
+    # ── Logged-in token-based usage limits ────────────────────
+    else:
+        user_message_preview = (request.get_json(silent=True) or {}).get("message", "")
+        allowed, used, remaining = check_token_limit(
+            f"auth:{client_key}", "auth", user_message_preview
         )
-        return resp, 429
-
-    rate_limit_store[auth_rate_key].append(now)
+        if not allowed:
+            resp = jsonify({
+                "error": "You've reached your token limit for this session. Please try again later.",
+                "code": "AUTH_TOKEN_LIMIT",
+                "tokens_used": used,
+                "tokens_remaining": 0,
+            })
+            resp.set_cookie("device_id", device_cookie, max_age=60*60*24*30, httponly=True, samesite="Lax")
+            return resp, 429
 
     data = request.get_json(silent=True)
 
