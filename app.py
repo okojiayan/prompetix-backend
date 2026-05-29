@@ -1466,25 +1466,19 @@ def generate():
                         "code": "AUDIO_GENERATION_FAILED"
                     }), 502
 
+                # ── Persist generated audio ────────────────
                 if email:
                     try:
                         ts = datetime.datetime.utcnow().isoformat()
-
                         with chat_db() as cur:
                             cur.execute(
-                                """
-                                INSERT INTO generations (email, input, output, ts)
-                                VALUES (%s, %s, %s, %s)
-                                """,
-                                (
-                                    email,
-                                    user_message,
-                                    "[AUDIO GENERATED]",
-                                    ts
-                                )
+                                """INSERT INTO generated_audios (email, audio_url, prompt, model, ts)
+                                   VALUES (%s, %s, %s, %s, %s)""",
+                                (email, audio_url, user_message, used_audio_model, ts)
                             )
+                        logger.info(f"Audio generated and persisted | email={email} | model={used_audio_model}")
                     except Exception as e:
-                        logger.warning(f"Failed to save audio history: {e}")
+                        logger.warning(f"Failed to persist audio generation: {e}")
 
                 resp = jsonify({
                     "type": "audio",
@@ -1560,6 +1554,20 @@ def generate():
                         "error": "Image generation temporarily unavailable.",
                         "code": "IMAGE_GENERATION_FAILED"
                     }), 502
+
+                # ── Persist generated image ────────────────
+                if email:
+                    try:
+                        ts = datetime.datetime.utcnow().isoformat()
+                        with chat_db() as cur:
+                            cur.execute(
+                                """INSERT INTO generated_images (email, image_b64, prompt, model, ts)
+                                   VALUES (%s, %s, %s, %s, %s)""",
+                                (email, image_data, user_message, used_image_model, ts)
+                            )
+                        logger.info(f"Image generated and persisted | email={email} | model={used_image_model}")
+                    except Exception as e:
+                        logger.warning(f"Failed to persist image generation: {e}")
 
                 resp = jsonify({
                     "type": "image",
@@ -2217,6 +2225,124 @@ def user_history():
 
     return jsonify([{"input": r[0], "output": r[1], "ts": r[2]} for r in rows])
 
+# ── File upload ───────────────────────────────────────────────
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """
+    Handle file uploads for documents, images, etc.
+    Supports: txt, pdf, doc, docx, json, py, js, html, csv, png, jpg, gif, webp
+    """
+    email, err = _validate_token()
+    # Allow guest uploads
+    if err:
+        email = None
+
+    if "file" not in request.files:
+        logger.warning("Upload endpoint called without file | ip=%s", request.remote_addr)
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "File has no name"}), 400
+
+    # Allowed extensions
+    ALLOWED_EXTS = {
+        "txt", "pdf", "doc", "docx", "json", "py", "js", "html", "css", "csv",
+        "png", "jpg", "jpeg", "gif", "webp"
+    }
+    
+    ext = file.filename.rsplit(".", 1)[1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED_EXTS:
+        logger.warning(f"Upload rejected — unsupported ext | file={file.filename} | ext={ext}")
+        return jsonify({"error": "File type not supported"}), 415
+
+    try:
+        file_data = file.read(10 * 1024 * 1024)  # 10MB max
+        if len(file_data) == 0:
+            return jsonify({"error": "File is empty"}), 400
+
+        # Store file metadata
+        ts = datetime.datetime.utcnow().isoformat()
+        file_id = f"file_{uuid.uuid4().hex[:12]}"
+        
+        if email:
+            try:
+                with chat_db() as cur:
+                    cur.execute(
+                        """INSERT INTO file_uploads (file_id, email, filename, size, ext, ts)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (file_id, email, file.filename, len(file_data), ext, ts)
+                    )
+                logger.info(f"File uploaded | email={email} | file={file.filename} | size={len(file_data)}")
+            except Exception as e:
+                logger.warning(f"Failed to log file upload: {e}")
+
+        return jsonify({
+            "status": "ok",
+            "file_id": file_id,
+            "filename": file.filename,
+            "size": len(file_data)
+        }), 201
+
+    except Exception as e:
+        logger.exception(f"File upload failed: {e}")
+        return jsonify({"error": "Upload failed"}), 500
+
+# ── Image generation with persistence ─────────────────────────
+@app.route("/user/images", methods=["GET"])
+def get_generated_images():
+    """List all generated images for user (media library)"""
+    email, err = _validate_token()
+    if err:
+        return err
+
+    try:
+        with chat_db() as cur:
+            cur.execute(
+                """SELECT id, image_b64, prompt, model, ts FROM generated_images 
+                   WHERE email = %s ORDER BY ts DESC LIMIT 50""",
+                (email,)
+            )
+            rows = cur.fetchall()
+        
+        return jsonify([{
+            "id": r[0],
+            "image": r[1],
+            "prompt": r[2],
+            "model": r[3],
+            "ts": r[4]
+        } for r in rows])
+    except Exception as e:
+        logger.warning(f"Failed to fetch user images: {e}")
+        return jsonify({"images": []})
+
+@app.route("/user/audios", methods=["GET"])
+def get_generated_audios():
+    """List all generated audio for user (media library)"""
+    email, err = _validate_token()
+    if err:
+        return err
+
+    try:
+        with chat_db() as cur:
+            cur.execute(
+                """SELECT id, audio_url, prompt, model, ts FROM generated_audios 
+                   WHERE email = %s ORDER BY ts DESC LIMIT 50""",
+                (email,)
+            )
+            rows = cur.fetchall()
+        
+        return jsonify([{
+            "id": r[0],
+            "audio": r[1],
+            "prompt": r[2],
+            "model": r[3],
+            "ts": r[4]
+        } for r in rows])
+    except Exception as e:
+        logger.warning(f"Failed to fetch user audios: {e}")
+        return jsonify({"audios": []})
+
 # ── Training: pair ────────────────────────────────────────────
 @app.route("/training/pair", methods=["POST"])
 def training_pair():
@@ -2254,29 +2380,44 @@ def google_login():
     redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
 
     if not redirect_uri:
-        logger.error("GOOGLE_REDIRECT_URI is missing")
+        logger.error("GOOGLE_REDIRECT_URI environment variable missing | client_ip=%s", request.remote_addr)
         return jsonify({
-            "error": "OAuth configuration unavailable.",
-            "code": "OAUTH_CONFIG_ERROR"
+            "error": "OAuth configuration unavailable. Please contact support.",
+            "code": "OAUTH_CONFIG_ERROR",
+            "details": "GOOGLE_REDIRECT_URI not configured"
         }), 500
-    return google.authorize_redirect(redirect_uri)
+    
+    logger.info("Google OAuth initiated | redirect_uri=%s | client_ip=%s", redirect_uri, request.remote_addr)
+    try:
+        return google.authorize_redirect(redirect_uri)
+    except Exception as e:
+        logger.exception("Google OAuth redirect failed | error=%s", str(e))
+        return jsonify({
+            "error": "Failed to initialize Google authentication.",
+            "code": "OAUTH_INIT_ERROR"
+        }), 500
 
 @app.route("/google-callback")
 def google_callback():
-    logger.info("Google OAuth callback triggered")
+    logger.info("Google OAuth callback triggered | ip=%s", request.remote_addr)
     try:
         token = google.authorize_access_token()
+        logger.debug("Google token received")
+        
         user_info = google.get("userinfo", token=token).json()
+        logger.debug("Google userinfo retrieved | keys=%s", list(user_info.keys()))
 
         email = user_info.get("email")
         name = user_info.get("name")
 
         if not email or not name:
+            logger.warning("Google callback missing data | email=%s | name=%s", email, name)
             return jsonify({
-                "error": "Google authentication failed.",
+                "error": "Google authentication failed — missing profile data.",
                 "code": "GOOGLE_USERDATA_MISSING"
             }), 400
 
+        logger.info("Google auth succeeded | email=%s | name=%s", email, name)
         ts = datetime.datetime.utcnow().isoformat()
 
         try:
@@ -2285,25 +2426,28 @@ def google_callback():
                 user = cur.fetchone()
 
                 if not user:
+                    logger.info("Creating new user from Google | email=%s", email)
                     cur.execute(
                         """INSERT INTO users (email, name, password, avatar, provider, consent, login_count, created_at, last_seen)
                            VALUES (%s, %s, '', %s, 'google', %s, %s, %s, %s)""",
                         (email, name, name[0].upper(), False, 1, ts, ts)
                     )
                 else:
+                    logger.info("Existing user login via Google | email=%s", email)
                     cur.execute(
                         "UPDATE users SET last_seen = %s, login_count = login_count + 1 WHERE email = %s",
                         (ts, email)
                     )
         except Exception as e:
-            logger.exception("Database error during Google login")
-
+            logger.exception("Database error during Google login | email=%s | error=%s", email, str(e))
             return jsonify({
-                "error": "Account login failed.",
+                "error": "Account login failed — database error.",
                 "code": "GOOGLE_DB_ERROR"
             }), 500
 
         session_token = _issue_token(email)
+        logger.info("Session token issued | email=%s | token_preview=%s***", email, session_token[:8])
+        
         # Send login notification email for Google login
         try:
             send_email(
@@ -2312,16 +2456,17 @@ def google_callback():
                 f"User: {email}\nName: {name}\nTime: {ts}\nMethod: Google OAuth"
             )
         except Exception as e:
-            logger.warning(f"Google login email error: {e}")
+            logger.warning("Google login notification email failed | email=%s | error=%s", email, str(e))
 
-        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com")
-        return redirect(f"{frontend_url}/login.html?token={session_token}&name={name}&email={email}")
+        frontend_url = os.environ.get("FRONTEND_URL", "https://atimosai.com").rstrip("/")
+        redirect_target = f"{frontend_url}/index.html?token={session_token}&name={name}&email={email}"
+        logger.info("Google OAuth success | email=%s | redirecting to %s", email, frontend_url)
+        return redirect(redirect_target)
 
     except Exception as e:
-        logger.exception("Google OAuth callback failure")
-
+        logger.exception("Google OAuth callback failure | ip=%s | error=%s", request.remote_addr, str(e))
         return jsonify({
-            "error": "Google authentication failed.",
+            "error": "Google authentication failed — server error.",
             "code": "GOOGLE_AUTH_ERROR"
         }), 500
 
