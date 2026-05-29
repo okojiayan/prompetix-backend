@@ -477,7 +477,12 @@ app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    # Allow cross-site OAuth redirects (Google) to include the session cookie.
+    # Set to 'None' so browsers will send the cookie on cross-site navigations
+    # initiated by the OAuth provider. Requires `SESSION_COOKIE_SECURE=True`.
+    SESSION_COOKIE_SAMESITE="None",
+    # Optional: allow overriding cookie domain from environment (useful in Render)
+    SESSION_COOKIE_DOMAIN=os.environ.get("SESSION_COOKIE_DOMAIN"),
     PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7)
 )
 
