@@ -526,11 +526,25 @@ google = oauth.register(
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 # DeepSeek routed through Pollinations — no separate key needed
 POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY")
-# Internal AI routing models
-_GROQ_MODELS    = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.1-8b-instant",
+# Groq model routing configuration
+# Priority order: primary → first fallback → optional second fallback.
+GROQ_MODEL_PRIMARY = os.environ.get("GROQ_MODEL_PRIMARY", "gpt-oss-120b").strip()
+GROQ_MODEL_FALLBACK_1 = os.environ.get("GROQ_MODEL_FALLBACK_1", "gpt-oss-20b").strip()
+GROQ_MODEL_FALLBACK_2 = os.environ.get("GROQ_MODEL_FALLBACK_2", "").strip()
+
+_GROQ_MODEL_CHAIN = [
+    m for m in (
+        GROQ_MODEL_PRIMARY,
+        GROQ_MODEL_FALLBACK_1,
+        GROQ_MODEL_FALLBACK_2,
+    ) if m
 ]
+
+if not _GROQ_MODEL_CHAIN:
+    raise RuntimeError(
+        "No Groq models configured. Set GROQ_MODEL_PRIMARY or configure GROQ_MODEL_FALLBACK_* environment variables."
+    )
+
 REQUEST_TIMEOUT = int(os.environ.get("PROMETIX_TIMEOUT", "18"))
 
 # SMTP/Email configuration
@@ -920,25 +934,41 @@ def call_groq(user_message: str) -> str:
     # ── Try Groq first (primary prompt engineer) ──────────────
     if GROQ_API_KEY:
         last_error = None
-        with ThreadPoolExecutor(max_workers=len(_GROQ_MODELS)) as executor:
-            futures = {
-                executor.submit(_call_single_model, model, messages): model
-                for model in _GROQ_MODELS
-            }
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    for f in futures:
-                        if f is not future:
-                            f.cancel()
-                    logger.info("Groq prompt engineering succeeded")
-                    return result
-                except Exception as e:
-                    last_error = e
+        chain_start = time()
+        for idx, model in enumerate(_GROQ_MODEL_CHAIN):
+            model_start = time()
+            try:
+                result = _call_single_model(model, messages)
+                model_latency = round(time() - model_start, 3)
+                total_latency = round(time() - chain_start, 3)
+                logger.info(
+                    "Groq prompt engineering succeeded | "
+                    f"model={model} | modelLatency={model_latency}s | "
+                    f"totalLatency={total_latency}s | attempt={idx + 1}/{len(_GROQ_MODEL_CHAIN)}"
+                )
+                return result
+            except Exception as e:
+                model_latency = round(time() - model_start, 3)
+                last_error = str(e)
+                if idx < len(_GROQ_MODEL_CHAIN) - 1:
+                    next_model = _GROQ_MODEL_CHAIN[idx + 1]
+                    logger.warning(
+                        "Groq model failed, falling back | "
+                        f"model={model} | reason={last_error} | "
+                        f"modelLatency={model_latency}s | nextModel={next_model} | "
+                        f"attempt={idx + 1}/{len(_GROQ_MODEL_CHAIN)}"
+                    )
                     continue
-
+                logger.error(
+                    "All Groq models failed | "
+                    f"lastModel={model} | reason={last_error} | "
+                    f"modelLatency={model_latency}s | "
+                    f"attempts={len(_GROQ_MODEL_CHAIN)}"
+                )
+        total_latency = round(time() - chain_start, 3)
         logger.warning(
-            f"Groq prompt engineering failed ({last_error}) — falling back to Pollinations"
+            f"Groq prompt engineering failed ({last_error}) — "
+            f"falling back to Pollinations | totalLatency={total_latency}s"
         )
     else:
         logger.warning("GROQ_API_KEY not set — falling back to Pollinations for prompt engineering")
@@ -2510,7 +2540,10 @@ def secure_headers(response):
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info("Prometix backend starting")
-    logger.info(f"AI backend initialized with {len(_GROQ_MODELS)} Groq models")
+    logger.info(
+        f"AI backend initialized with {len(_GROQ_MODEL_CHAIN)} Groq models "
+        f"(chain={_GROQ_MODEL_CHAIN})"
+    )
     logger.info("Database: Supabase Auth + Neon AI Storage")
     logger.info("Security systems initialized")
     port = int(os.environ.get("PORT", 10000))
